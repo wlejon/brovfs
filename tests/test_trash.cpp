@@ -1,112 +1,402 @@
+// Trash. Windows: the real Recycle Bin, touching only items this test created (all under its
+// scratch dir), restoring or erasing every one of them. POSIX: the freedesktop trash with the
+// home trash and every top-directory trash inside scratch directories; trash-cli, when
+// installed, is used as an independent oracle with XDG_DATA_HOME pointed at scratch.
 #include "brovfs/trash.h"
-#include "brovfs/trash_freedesktop.h"
-#include <cassert>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <string>
+#include "harness.h"
 
-#ifdef _WIN32
-#include <crtdbg.h>
-#include <cstdlib>
+#include <ctime>
+#include <optional>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
-namespace fs = std::filesystem;
+using namespace t;
 
-namespace {
-
-void make_file(const fs::path& p, const std::string& text) {
-    fs::create_directories(p.parent_path());
-    std::ofstream out(p);
-    out << text;
+static bool within(const fs::path& p, const fs::path& dir) {
+    auto rel = p.lexically_relative(dir);
+    return !rel.empty() && rel.native().rfind(fs::path("..").native(), 0) != 0;
 }
 
-std::string get_text(const fs::path& p) {
-    std::ifstream in(p);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+// Returns a copy: callers routinely pass a temporary list().
+static std::optional<vfs::TrashItem> find_id(const std::vector<vfs::TrashItem>& items, const std::string& id) {
+    for (auto& i : items) {
+        if (i.id == id) return i;
+    }
+    return std::nullopt;
 }
 
-} // namespace
+static bool same_path(const fs::path& a, const fs::path& b) {
+#ifdef _WIN32
+    return _wcsicmp(a.c_str(), b.c_str()) == 0;
+#else
+    return a == b;
+#endif
+}
+
+static void common_checks(vfs::Trash& trash, const Scratch& s, const std::string& tag) {
+    section("trash, list, restore a file");
+    fs::path f = s / p8(tag + "_file name & ü%25 #.txt");
+    write_file(f, "to the trash");
+    std::string id;
+    std::error_code ec;
+    CHECK_MSG(trash.trash(f, &id, ec), ec.message());
+    CHECK(!path_exists(f) && !id.empty());
+    auto items = trash.list();
+    auto it = find_id(items, id);
+    if (!CHECK(it.has_value())) {
+        note("trash() id: " + id);
+        for (auto& i : items) {
+            if (within(i.original_path, s.root())) note("listed id: " + i.id);
+        }
+    }
+    if (it) {
+        CHECK_MSG(same_path(it->original_path, f), u8(it->original_path));
+        CHECK(it->size == 12 && !it->is_directory);
+        CHECK(it->name == tag + "_file name & ü%25 #.txt");
+        int64_t now = static_cast<int64_t>(std::time(nullptr)) * 1000;
+        CHECK_MSG(it->deletion_time_ms > now - 120000 && it->deletion_time_ms < now + 120000,
+                  std::to_string(it->deletion_time_ms) + " vs " + std::to_string(now));
+    }
+    fs::path restored;
+    CHECK_MSG(trash.restore(id, vfs::RestoreConflict::Fail, &restored, ec), ec.message());
+    CHECK(read_file(f) == "to the trash" && same_path(restored, f));
+    CHECK(!find_id(trash.list(), id));
+
+    section("restore never overwrites what now occupies the original path");
+    CHECK(trash.trash(f, &id, ec));
+    write_file(f, "new work");
+    CHECK(!trash.restore(id, vfs::RestoreConflict::Fail, &restored, ec) && ec == vfs::Errc::restore_target_exists);
+    CHECK(read_file(f) == "new work" && find_id(trash.list(), id).has_value());
+    CHECK_MSG(trash.restore(id, vfs::RestoreConflict::KeepBoth, &restored, ec), ec.message());
+    CHECK(read_file(f) == "new work" && read_file(restored) == "to the trash" && !same_path(restored, f));
+
+    section("directories (trailing separator), unicode names, missing parent on restore");
+    fs::path d = s / p8(tag + "_dir 日本");
+    write_file(d / "inner.txt", "in");
+    write_file(d / "sub" / "deep.txt", "deeper");
+    fs::path with_slash = d;
+    with_slash += fs::path::preferred_separator;
+    CHECK_MSG(trash.trash(with_slash, &id, ec), ec.message());
+    CHECK(!path_exists(d));
+    it = find_id(trash.list(), id);
+    CHECK(it && it->is_directory && same_path(it->original_path, d));
+    CHECK(trash.restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(d / "sub" / "deep.txt") == "deeper");
+
+    fs::path nested = s / p8(tag + "_parent") / "child.txt";
+    write_file(nested, "child");
+    CHECK(trash.trash(nested, &id, ec));
+    vfs::remove({s / p8(tag + "_parent")});
+    CHECK_MSG(trash.restore(id, vfs::RestoreConflict::Fail, nullptr, ec), ec.message());
+    CHECK(read_file(nested) == "child");
+
+    section("erase only what the id names; forged ids are refused");
+    fs::path e = s / p8(tag + "_erase.txt");
+    write_file(e, "bye");
+    CHECK(trash.trash(e, &id, ec));
+    CHECK_MSG(trash.erase(id, ec), ec.message());
+    CHECK(!find_id(trash.list(), id) && !path_exists(e));
+    CHECK(!trash.erase(id, ec)); // already gone
+
+    write_file(s / "victim" / "precious.txt", "do not delete");
+    for (const std::string& forged :
+         {u8(s / "victim"), u8(s / "victim" / "precious.txt"), std::string("../../victim"), std::string(),
+          std::string("12:/etc/passwd..")}) {
+        CHECK_MSG(!trash.erase(forged, ec), forged);
+        CHECK(!trash.restore(forged, vfs::RestoreConflict::Fail, nullptr, ec));
+    }
+    CHECK(read_file(s / "victim" / "precious.txt") == "do not delete");
+
+    section("missing source");
+    CHECK(!trash.trash(s / "missing.txt", &id, ec));
+}
+
+#ifdef _WIN32
+
+// Erases this run's items, plus orphans of an earlier run of this test that died before its
+// cleanup: items from a "trash-*" scratch dir under the scratch base. Never anything else.
+static bool own_item(const vfs::TrashItem& item, const Scratch& s) {
+    if (within(item.original_path, s.root())) return true;
+    std::error_code ec;
+    fs::path base = fs::absolute(scratch_base(), ec);
+    if (ec || !within(item.original_path, base)) return false;
+    fs::path first = *item.original_path.lexically_relative(base).begin();
+    return first.native().rfind(fs::path("trash-").native(), 0) == 0 &&
+           item.name.find("brovfstest") != std::string::npos;
+}
+
+static void cleanup_own_items(vfs::Trash& trash, const Scratch& s) {
+    int n = 0;
+    for (auto& item : trash.list()) {
+        if (!own_item(item, s)) continue; // never touch anything else
+        std::error_code ec;
+        if (trash.erase(item.id, ec)) ++n;
+    }
+    if (n) note("cleanup erased " + std::to_string(n) + " leftover test item(s)");
+}
+
+static void windows_specific(vfs::Trash& trash, const Scratch& s, const std::string& tag) {
+    section("Recycle Bin: id names a $R entry of this user's bin");
+    fs::path f = s / p8(tag + "_shape.txt");
+    write_file(f, "x");
+    std::string id;
+    std::error_code ec;
+    CHECK(trash.trash(f, &id, ec));
+    fs::path stored = p8(id);
+    CHECK(stored.filename().native().rfind(L"$R", 0) == 0);
+    CHECK(_wcsicmp(stored.parent_path().parent_path().filename().c_str(), L"$Recycle.Bin") == 0);
+    // A $R path with ".." or in another directory is not an id.
+    fs::path forged = stored.parent_path() / L".." / stored.filename();
+    CHECK(!trash.erase(u8(forged), ec) && ec == vfs::Errc::invalid_trash_id);
+    CHECK(trash.restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && path_exists(f));
+
+    section("no Recycle Bin (UNC path): refused, nothing deleted");
+    fs::path local = s / p8(tag + "_unc.txt");
+    write_file(local, "network path victim");
+    std::wstring dp = fs::absolute(local).native();
+    fs::path unc = std::wstring(L"\\\\localhost\\") + dp[0] + L"$" + dp.substr(2);
+    if (path_exists(unc)) {
+        bool ok = trash.trash(unc, &id, ec);
+        CHECK(!ok && ec == vfs::Errc::no_trash_available);
+        CHECK(read_file(local) == "network path victim");
+        if (ok) trash.restore(id, vfs::RestoreConflict::Fail, nullptr, ec);
+    } else {
+        note("admin share \\\\localhost\\X$ not reachable; UNC case skipped");
+    }
+}
 
 int main() {
-#ifdef _WIN32
-    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-#endif
-    std::cout << "[test_trash] Initializing test directories..." << std::endl;
-    fs::path scratch = fs::current_path() / "test_scratch_trash";
-    std::error_code ec;
-    fs::remove_all(scratch, ec);
-    fs::create_directories(scratch, ec);
-
-    fs::path trash_dir = scratch / "DesktopTrash";
-    auto provider = std::make_shared<bro::vfs::FreeDesktopTrash>(trash_dir.generic_string());
-
-    fs::path orig_file = scratch / "workspace" / "important_document.txt";
-    make_file(orig_file, "Very important confidential notes.");
-
-    std::cout << "[test_trash] Testing FreeDesktopTrash::trash_path..." << std::endl;
-    std::string trash_id;
-    bool trash_ok = provider->trash_path(orig_file.generic_string(), &trash_id);
-    assert(trash_ok);
-    assert(!trash_id.empty());
-    assert(!fs::exists(orig_file)); // Original file was removed
-    assert(fs::exists(fs::path(provider->get_files_dir()) / trash_id));
-    assert(fs::exists(fs::path(provider->get_info_dir()) / (trash_id + ".trashinfo")));
-
-    std::cout << "[test_trash] Testing FreeDesktopTrash::list_trash..." << std::endl;
-    auto items = provider->list_trash();
-    assert(items.size() == 1);
-    assert(items[0].id == trash_id);
-    assert(items[0].size > 0);
-    assert(items[0].deletion_time_ms > 0);
-
-    std::cout << "[test_trash] Testing collision resolution when trashing duplicate filename..." << std::endl;
-    make_file(orig_file, "Second version of important document.");
-    std::string trash_id2;
-    assert(provider->trash_path(orig_file.generic_string(), &trash_id2));
-    assert(trash_id2 != trash_id); // Unique ID assigned
-    items = provider->list_trash();
-    assert(items.size() == 2);
-
-    std::cout << "[test_trash] Testing FreeDesktopTrash::restore_item..." << std::endl;
-    // Restore the first item
-    assert(provider->restore_item(trash_id));
-    assert(fs::exists(orig_file));
-    assert(get_text(orig_file) == "Very important confidential notes.");
-    assert(!fs::exists(fs::path(provider->get_info_dir()) / (trash_id + ".trashinfo")));
-    assert(!fs::exists(fs::path(provider->get_files_dir()) / trash_id));
-
-    std::cout << "[test_trash] Testing trashing and restoring a directory..." << std::endl;
-    fs::path test_dir = scratch / "workspace" / "nested_dir";
-    make_file(test_dir / "child1.txt", "Child 1 content");
-    make_file(test_dir / "sub" / "child2.txt", "Child 2 content");
-
-    std::string dir_trash_id;
-    assert(provider->trash_path(test_dir.generic_string(), &dir_trash_id));
-    assert(!fs::exists(test_dir));
-
-    assert(provider->restore_item(dir_trash_id));
-    assert(fs::exists(test_dir / "child1.txt"));
-    assert(fs::exists(test_dir / "sub" / "child2.txt"));
-    assert(get_text(test_dir / "sub" / "child2.txt") == "Child 2 content");
-
-    std::cout << "[test_trash] Testing FreeDesktopTrash::empty_trash..." << std::endl;
-    assert(provider->empty_trash());
-    items = provider->list_trash();
-    assert(items.empty());
-
-    std::cout << "[test_trash] Testing global trash API hooks..." << std::endl;
-    bro::vfs::set_default_trash_provider(provider);
-    make_file(orig_file, "Global hook test file");
-    std::string global_id;
-    assert(bro::vfs::trash(orig_file.generic_string(), &global_id));
-    assert(bro::vfs::list_trash().size() == 1);
-    assert(bro::vfs::restore_trash(global_id));
-    assert(fs::exists(orig_file));
-
-    fs::remove_all(scratch, ec);
-    std::cout << "[test_trash] All trash tests passed successfully!" << std::endl;
-    return 0;
+    Scratch s("trash");
+    auto bin = vfs::make_recycle_bin();
+    std::string tag = "brovfstest" + std::to_string(GetTickCount64() % 100000000);
+    common_checks(*bin, s, tag);
+    windows_specific(*bin, s, tag);
+    cleanup_own_items(*bin, s);
+    // The system trash is the Recycle Bin.
+    CHECK(vfs::system_trash() != nullptr);
+    return finish("test_trash");
 }
+
+#else
+
+static std::string sh(const std::string& cmd) {
+    std::string out;
+    FILE* p = ::popen(cmd.c_str(), "r");
+    if (!p) return out;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+    ::pclose(p);
+    return out;
+}
+
+static std::string quote(const fs::path& p) {
+    std::string s = "'";
+    for (char c : p.native()) s += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return s + "'";
+}
+
+static std::string info_of(const fs::path& trash_dir, const std::string& name) {
+    return read_file(trash_dir / "info" / (name + ".trashinfo"));
+}
+
+static void freedesktop_specific(const Scratch& s, const fs::path& home_trash) {
+    vfs::FreedesktopTrashConfig cfg;
+    cfg.home_trash = home_trash;
+    cfg.search_mounts = false;
+    auto trash = vfs::make_freedesktop_trash(cfg);
+    std::error_code ec;
+    std::string id;
+
+    section("freedesktop: .trashinfo format (encoded absolute Path, local DeletionDate)");
+    fs::path f = s / "work" / "a b%.txt";
+    write_file(f, "x");
+    CHECK(trash->trash(f, &id, ec));
+    std::string info = info_of(home_trash, "a b%.txt");
+    CHECK_MSG(info.rfind("[Trash Info]\n", 0) == 0, info);
+    std::string enc = "Path=";
+    for (unsigned char c : f.native()) {
+        bool keep = std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+        char buf[4];
+        std::snprintf(buf, sizeof(buf), "%%%02X", c);
+        enc += keep ? std::string(1, static_cast<char>(c)) : std::string(buf);
+    }
+    CHECK_MSG(info.find(enc + "\n") != std::string::npos, info);
+    char hour[32];
+    std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    std::strftime(hour, sizeof(hour), "DeletionDate=%Y-%m-%dT%H", &tm);
+    CHECK_MSG(info.find(hour) != std::string::npos, info);
+    struct stat st{};
+    CHECK(::stat((home_trash / "info" / "a b%.txt.trashinfo").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+
+    section("freedesktop: name collisions, including a stray info file");
+    write_file(s / "w1" / "dup.txt", "1");
+    write_file(s / "w2" / "dup.txt", "2");
+    std::string id1, id2;
+    CHECK(trash->trash(s / "w1" / "dup.txt", &id1, ec) && trash->trash(s / "w2" / "dup.txt", &id2, ec));
+    CHECK(id1 != id2);
+    CHECK(read_file(home_trash / "files" / "dup.txt") == "1" && read_file(home_trash / "files" / "dup.2.txt") == "2");
+    write_file(home_trash / "info" / "stray.txt.trashinfo", "[Trash Info]\nPath=/nowhere\n");
+    write_file(s / "w1" / "stray.txt", "s");
+    CHECK(trash->trash(s / "w1" / "stray.txt", &id, ec));
+    CHECK(read_file(home_trash / "files" / "stray.2.txt") == "s");
+    CHECK(read_file(home_trash / "info" / "stray.txt.trashinfo") == "[Trash Info]\nPath=/nowhere\n");
+
+    section("freedesktop: directorysizes kept in step");
+    write_big(s / "w3" / "folder" / "blob", 10000);
+    write_file(s / "w3" / "folder" / "x", "12345");
+    CHECK(trash->trash(s / "w3" / "folder", &id, ec));
+    std::string ds = read_file(home_trash / "directorysizes");
+    CHECK_MSG(ds.rfind("10005 ", 0) == 0 && ds.find(" folder\n") != std::string::npos, ds);
+    auto it = find_id(trash->list(), id);
+    CHECK(it && it->is_directory && it->size == 10005);
+    CHECK(trash->erase(id, ec));
+    CHECK(read_file(home_trash / "directorysizes").find(" folder\n") == std::string::npos);
+
+    section("freedesktop: symlinks are trashed as links");
+    write_file(s / "lt" / "target.txt", "t");
+    fs::create_symlink("target.txt", s / "lt" / "link", ec);
+    CHECK(trash->trash(s / "lt" / "link", &id, ec));
+    CHECK(fs::is_symlink(fs::symlink_status(home_trash / "files" / "link")) && read_file(s / "lt" / "target.txt") == "t");
+    CHECK(trash->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && fs::is_symlink(fs::symlink_status(s / "lt" / "link")));
+
+    section("freedesktop: refuses to trash the trash");
+    CHECK(!trash->trash(home_trash, &id, ec) && path_exists(home_trash / "files"));
+}
+
+static void topdir_trash(const Scratch& s, const fs::path& home_trash) {
+    fs::path other = other_volume_base(s.root());
+    section("freedesktop: top-directory trash on another device");
+    if (other.empty()) {
+        note("no second device; skipped");
+        return;
+    }
+    Scratch top("trash-top", other);
+    const std::string uid = std::to_string(::getuid());
+    vfs::FreedesktopTrashConfig cfg;
+    cfg.home_trash = home_trash;
+    cfg.search_mounts = false;
+    cfg.extra_topdirs = {top.root()};
+    cfg.topdir_of = [&](const fs::path&) { return top.root(); };
+    auto trash = vfs::make_freedesktop_trash(cfg);
+    std::error_code ec;
+    std::string id;
+
+    fs::path f = top / "sub" / "file.txt";
+    write_file(f, "on another device");
+    CHECK_MSG(trash->trash(f, &id, ec), ec.message());
+    fs::path tdir = top / (".Trash-" + uid);
+    CHECK(read_file(tdir / "files" / "file.txt") == "on another device");
+    CHECK_MSG(info_of(tdir, "file.txt").find("Path=sub/file.txt\n") != std::string::npos, info_of(tdir, "file.txt"));
+    struct stat st{};
+    CHECK(::stat(tdir.c_str(), &st) == 0 && (st.st_mode & 0777) == 0700);
+    auto it = find_id(trash->list(), id);
+    CHECK(it && it->original_path == f);
+    CHECK(trash->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(f) == "on another device");
+
+    section("freedesktop: shared $topdir/.Trash/$uid only when sticky");
+    Scratch top2("trash-top2", other);
+    cfg.extra_topdirs = {top2.root()};
+    cfg.topdir_of = [&](const fs::path&) { return top2.root(); };
+    auto t2 = vfs::make_freedesktop_trash(cfg);
+    fs::create_directories(top2 / ".Trash");
+    ::chmod((top2 / ".Trash").c_str(), 0777); // not sticky: must not be used
+    write_file(top2 / "g.txt", "g");
+    CHECK(t2->trash(top2 / "g.txt", &id, ec));
+    CHECK(path_exists(top2 / (".Trash-" + uid) / "files" / "g.txt") && !path_exists(top2 / ".Trash" / uid));
+    ::chmod((top2 / ".Trash").c_str(), 01777);
+    write_file(top2 / "h.txt", "h");
+    CHECK(t2->trash(top2 / "h.txt", &id, ec));
+    CHECK(path_exists(top2 / ".Trash" / uid / "files" / "h.txt"));
+    CHECK(t2->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(top2 / "h.txt") == "h");
+
+    section("freedesktop: no usable trash on the device -> refused, nothing deleted");
+    Scratch top3("trash-top3", other);
+    cfg.topdir_of = [&](const fs::path&) { return top3.root(); };
+    // A read-only top directory: no trash can be created there, but w/ stays writable.
+    const fs::path keep = top3 / "w" / "keep.txt";
+    write_file(keep, "keep");
+    ::chmod(top3.root().c_str(), 0555);
+    auto t3 = vfs::make_freedesktop_trash(cfg);
+    bool ok = t3->trash(keep, &id, ec);
+    if (!is_root_user()) {
+        CHECK(!ok && ec == vfs::Errc::no_trash_available && read_file(keep) == "keep");
+    }
+
+    section("freedesktop: opt-in home-trash fallback across devices (verified move)");
+    cfg.allow_home_trash_across_devices = true;
+    auto t4 = vfs::make_freedesktop_trash(cfg);
+    if (!is_root_user()) {
+        // Source that cannot be unlinked: the move must fail with the file intact and no
+        // residue in the home trash.
+        ::chmod((top3 / "w").c_str(), 0555);
+        ok = t4->trash(keep, &id, ec);
+        ::chmod((top3 / "w").c_str(), 0755);
+        CHECK_MSG(!ok && read_file(keep) == "keep", ec.message());
+        CHECK(!path_exists(home_trash / "files" / "keep.txt") && !path_exists(home_trash / "info" / "keep.txt.trashinfo"));
+
+        ok = t4->trash(keep, &id, ec);
+        CHECK_MSG(ok && !path_exists(keep) && read_file(home_trash / "files" / "keep.txt") == "keep", ec.message());
+        it = find_id(t4->list(), id);
+        CHECK(it && it->original_path == keep);
+        CHECK(t4->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(keep) == "keep");
+    }
+    ::chmod(top3.root().c_str(), 0755);
+}
+
+static void trash_cli_oracle(const Scratch& s, const fs::path& xdg) {
+    section("trash-cli oracle (XDG_DATA_HOME in scratch)");
+    std::string have = sh("command -v trash-list || ls $HOME/.local/bin/trash-list 2>/dev/null");
+    if (have.empty()) {
+        note("trash-cli not installed; skipped");
+        return;
+    }
+    std::string env = "PATH=$HOME/.local/bin:$PATH XDG_DATA_HOME=" + quote(xdg) + " ";
+    auto trash = vfs::make_freedesktop_trash(); // default home trash = $XDG_DATA_HOME/Trash
+    std::error_code ec;
+    std::string id;
+    fs::path f = s / "cli" / "odd name ü & %.txt";
+    write_file(f, "odd");
+    CHECK(trash->trash(f, &id, ec));
+    CHECK(path_exists(xdg / "Trash" / "files" / "odd name ü & %.txt"));
+    std::string listing = sh(env + "trash-list 2>&1");
+    CHECK_MSG(listing.find(f.native()) != std::string::npos, listing);
+    // trash-cli restores an item brovfs trashed.
+    sh("cd " + quote(s / "cli") + " && echo 0 | " + env + "trash-restore 2>&1");
+    CHECK(read_file(f) == "odd");
+    // brovfs lists and restores an item trashed by trash-cli.
+    write_file(s / "cli" / "by_cli.txt", "cli");
+    sh(env + "trash-put " + quote(s / "cli" / "by_cli.txt") + " 2>&1");
+    CHECK(!path_exists(s / "cli" / "by_cli.txt"));
+    std::string cid;
+    for (auto& item : trash->list()) {
+        if (item.original_path == s / "cli" / "by_cli.txt") cid = item.id;
+    }
+    CHECK(!cid.empty());
+    CHECK(!cid.empty() && trash->restore(cid, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(s / "cli" / "by_cli.txt") == "cli");
+}
+
+int main() {
+    Scratch s("trash");
+    fs::path xdg = s / "xdg";
+    ::setenv("XDG_DATA_HOME", xdg.c_str(), 1); // nothing in this process may reach the real trash
+    fs::path home_trash = xdg / "Trash";
+    vfs::FreedesktopTrashConfig cfg;
+    cfg.home_trash = home_trash;
+    cfg.search_mounts = false;
+    auto trash = vfs::make_freedesktop_trash(cfg);
+    common_checks(*trash, s, "fdtest");
+    freedesktop_specific(s, home_trash);
+    topdir_trash(s, home_trash);
+    trash_cli_oracle(s, xdg);
+    section("empty() on the scratch trash");
+    auto r = trash->empty();
+    CHECK_MSG(r.ok() && trash->list().empty(), describe(r));
+    return finish("test_trash");
+}
+
+#endif

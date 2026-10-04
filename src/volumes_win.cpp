@@ -51,7 +51,7 @@ std::vector<VolumeInfo> list_volumes_platform() {
         }
 
         VolumeInfo info;
-        info.mount_point = wide_to_utf8(drive.c_str());
+        info.mount_point = std::filesystem::path(drive);
         // Normalize mount point with forward slash if needed, or keep standard C:\
 
         if (drive_type == DRIVE_REMOVABLE) {

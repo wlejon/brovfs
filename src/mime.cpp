@@ -75,8 +75,40 @@ std::string sniff_mime_type(std::span<const uint8_t> data) {
     // GIF: GIF87a or GIF89a
     if (starts_with_str(data, "GIF87a") || starts_with_str(data, "GIF89a")) return "image/gif";
 
-    // BMP: 42 4D ("BM")
-    if (starts_with_str(data, "BM")) return "image/bmp";
+    // BMP: "BM", reserved words zero, DIB header size one of the known values.
+    if (starts_with_str(data, "BM") && data.size() >= 18) {
+        uint32_t dib = static_cast<uint32_t>(data[14]) | (static_cast<uint32_t>(data[15]) << 8) |
+                       (static_cast<uint32_t>(data[16]) << 16) | (static_cast<uint32_t>(data[17]) << 24);
+        bool reserved_zero = data[6] == 0 && data[7] == 0 && data[8] == 0 && data[9] == 0;
+        if (reserved_zero && (dib == 12 || dib == 40 || dib == 52 || dib == 56 || dib == 64 || dib == 108 || dib == 124)) {
+            return "image/bmp";
+        }
+    }
+
+    // Fonts
+    static const uint8_t TTF_MAGIC[] = {0x00, 0x01, 0x00, 0x00};
+    if (data.size() >= 12 && (starts_with(data, TTF_MAGIC) || starts_with_str(data, "true"))) {
+        // sfnt: numTables (big-endian u16 at 4) must be plausible to avoid false positives.
+        uint16_t tables = static_cast<uint16_t>((data[4] << 8) | data[5]);
+        if (tables > 0 && tables < 64) return "font/ttf";
+    }
+    if (starts_with_str(data, "OTTO")) return "font/otf";
+    if (starts_with_str(data, "ttcf")) return "font/collection";
+    if (starts_with_str(data, "wOFF")) return "font/woff";
+    if (starts_with_str(data, "wOF2")) return "font/woff2";
+    // Type 1: PFA is text "%!PS-AdobeFont" / "%!FontType1"; PFB wraps it in segments
+    // (0x80 0x01, u32 length) so the text starts at offset 6.
+    if (starts_with_str(data, "%!PS-AdobeFont") || starts_with_str(data, "%!FontType1")) return "font/x-type1";
+    if (data.size() >= 6 + 11 && data[0] == 0x80 && data[1] == 0x01) {
+        auto rest = data.subspan(6);
+        if (starts_with_str(rest, "%!PS-AdobeFont") || starts_with_str(rest, "%!FontType1")) return "font/x-type1";
+    }
+
+    // 3D models: binary glTF ("glTF" + version 2 little-endian)
+    if (data.size() >= 8 && starts_with_str(data, "glTF") && data[4] == 2 && data[5] == 0 && data[6] == 0 &&
+        data[7] == 0) {
+        return "model/gltf-binary";
+    }
 
     // WebP: RIFF....WEBP
     if (data.size() >= 12 && starts_with_str(data, "RIFF") &&
@@ -272,13 +304,21 @@ std::string sniff_mime_type(std::span<const uint8_t> data) {
         return "text/html";
     }
 
-    // JSON: leading whitespace followed by { or [
-    size_t non_ws = 0;
-    while (non_ws < data.size() && std::isspace(data[non_ws])) {
-        non_ws++;
-    }
+    // JSON: { or [ followed by a token that can start a member / value (so an INI
+    // "[Section]" header or a "{name}" template is not JSON).
+    auto skip_ws = [&](size_t i) {
+        while (i < data.size() && std::isspace(data[i])) i++;
+        return i;
+    };
+    size_t non_ws = skip_ws(0);
     if (non_ws < data.size() && (data[non_ws] == '{' || data[non_ws] == '[')) {
-        return "application/json";
+        size_t next = skip_ws(non_ws + 1);
+        if (next >= data.size()) return "application/json";
+        char c = static_cast<char>(data[next]);
+        bool ok = data[non_ws] == '{' ? (c == '"' || c == '}')
+                                      : (c == '"' || c == '{' || c == '[' || c == ']' || c == '-' ||
+                                         (c >= '0' && c <= '9') || c == 't' || c == 'f' || c == 'n');
+        if (ok) return "application/json";
     }
 
     // Check if plain text or binary
@@ -289,7 +329,8 @@ std::string sniff_mime_type(std::span<const uint8_t> data) {
     return "text/plain";
 }
 
-std::string sniff_mime_type_from_file(const std::string& path, size_t max_read_bytes) {
+std::string sniff_mime_type_from_file(const std::filesystem::path& path, size_t max_read_bytes) {
+    // std::filesystem::path opens with the wide API on Windows: Unicode names work.
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         return "application/octet-stream";
@@ -311,6 +352,7 @@ std::string get_mime_category(std::string_view mime_type) {
     if (mime_type.starts_with("audio/")) return "audio";
     if (mime_type.starts_with("video/")) return "video";
     if (mime_type.starts_with("font/")) return "font";
+    if (mime_type.starts_with("model/")) return "model";
 
     if (mime_type == "application/pdf" || mime_type == "application/rtf" ||
         mime_type == "application/postscript" || mime_type == "application/epub+zip") {
@@ -400,7 +442,17 @@ const std::unordered_map<std::string, std::string>& get_extension_map() {
         {"py", "text/x-python"},
         {"sh", "application/x-shellscript"},
         {"txt", "text/plain"},
-        {"md", "text/markdown"}
+        {"md", "text/markdown"},
+        {"ttf", "font/ttf"},
+        {"otf", "font/otf"},
+        {"ttc", "font/collection"},
+        {"woff", "font/woff"},
+        {"woff2", "font/woff2"},
+        {"pfa", "font/x-type1"},
+        {"pfb", "font/x-type1"},
+        {"t1", "font/x-type1"},
+        {"glb", "model/gltf-binary"},
+        {"gltf", "model/gltf+json"}
     };
     return ext_map;
 }
@@ -454,7 +506,15 @@ const std::unordered_map<std::string, std::string>& get_mime_to_ext_map() {
         {"text/x-python", "py"},
         {"application/x-shellscript", "sh"},
         {"text/plain", "txt"},
-        {"text/markdown", "md"}
+        {"text/markdown", "md"},
+        {"font/ttf", "ttf"},
+        {"font/otf", "otf"},
+        {"font/collection", "ttc"},
+        {"font/woff", "woff"},
+        {"font/woff2", "woff2"},
+        {"font/x-type1", "pfb"},
+        {"model/gltf-binary", "glb"},
+        {"model/gltf+json", "gltf"}
     };
     return mime_map;
 }

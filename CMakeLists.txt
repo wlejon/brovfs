@@ -1,52 +1,42 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(brovfs VERSION 0.1.0 LANGUAGES CXX)
+project(brovfs VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(MSVC)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-    add_compile_options(
-        $<$<COMPILE_LANGUAGE:CXX>:/MP>
-        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
-        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-        $<$<COMPILE_LANGUAGE:CXX>:/W4>
-    )
-    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    endif()
-else()
-    add_compile_options(
-        -Wall
-        -Wextra
-        -Wpedantic
-    )
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 set(BROVFS_SOURCES
-    src/version.cpp
-    src/types.cpp
-    src/scanner.cpp
     src/file_ops.cpp
-    src/reflink.cpp
-    src/trash_common.cpp
-    src/trash_freedesktop.cpp
-    src/volumes.cpp
     src/mime.cpp
-    src/vfs.cpp
+    src/path.cpp
+    src/remove.cpp
+    src/scanner.cpp
+    src/sys_common.cpp
+    src/transfer.cpp
+    src/trash_common.cpp
+    src/types.cpp
+    src/version.cpp
+    src/volumes.cpp
+    src/walk.cpp
+    src/worker.cpp
 )
 
 if(WIN32)
     list(APPEND BROVFS_SOURCES
-        src/scanner_win.cpp
-        src/trash_win.cpp
+        src/sys_win.cpp
+        src/sys_win_copy.cpp
+        src/trash_recycle_bin.cpp
         src/volumes_win.cpp
     )
 else()
     list(APPEND BROVFS_SOURCES
-        src/scanner_posix.cpp
+        src/sys_posix.cpp
+        src/trash_freedesktop.cpp
         src/volumes_posix.cpp
     )
 endif()
@@ -62,11 +52,23 @@ target_include_directories(brovfs
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-if(WIN32)
-    target_link_libraries(brovfs PUBLIC shell32 ole32)
+if(MSVC)
+    target_compile_options(brovfs PRIVATE /W4 /permissive- /utf-8 /MP)
+else()
+    target_compile_options(brovfs PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-option(BROVFS_BUILD_TESTS "Build brovfs test suite" ON)
+if(WIN32)
+    # Windows 10 1809+ APIs (FileDispositionInfoEx with IGNORE_READONLY, FileIdExtdDirectoryInfo);
+    # each has a runtime fallback.
+    target_compile_definitions(brovfs PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000006 UNICODE _UNICODE)
+    target_link_libraries(brovfs PUBLIC shell32 ole32 advapi32)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(brovfs PUBLIC Threads::Threads)
+endif()
+
+option(BROVFS_BUILD_TESTS "Build the brovfs test suite" ON)
 if(BROVFS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

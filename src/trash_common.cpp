@@ -1,80 +1,49 @@
 #include "brovfs/trash.h"
-#include "brovfs/trash_freedesktop.h"
+
+#include "src/engine.h"
 
 #include <mutex>
 
 namespace bro::vfs {
 
+OpResult trash_paths(Trash& trash, const std::vector<fs::path>& paths,
+                     const std::function<bool(const ProgressInfo&)>& on_progress,
+                     std::shared_ptr<CancellationToken> token) {
+    OpResult r;
+    ProgressCallback cb = on_progress;
+    detail::Progress prog(&cb, token.get());
+    prog.phase(Phase::Trashing);
+    prog.add_totals(0, paths.size());
+    for (const auto& p : paths) {
+        if (!prog.begin_item(p)) break;
+        std::string id;
+        std::error_code ec;
+        if (trash.trash(p, &id, ec)) {
+            r.trash_ids.push_back(id);
+            ++r.files_done;
+        } else {
+            r.trash_ids.push_back(std::string());
+            r.errors.push_back({p, {}, ec, "trash"});
+        }
+        prog.end_item();
+    }
+    while (r.trash_ids.size() < paths.size()) r.trash_ids.push_back(std::string());
+    detail::finish_result(r, prog.stopped());
+    return r;
+}
+
+std::shared_ptr<Trash> system_trash() {
+    static std::mutex m;
+    static std::shared_ptr<Trash> instance;
+    std::lock_guard<std::mutex> lock(m);
+    if (!instance) {
 #ifdef _WIN32
-std::shared_ptr<ITrashProvider> create_windows_recycle_bin();
-#endif
-
-namespace {
-
-std::mutex g_trash_mutex;
-std::shared_ptr<ITrashProvider> g_default_trash_provider;
-
-std::shared_ptr<ITrashProvider> get_or_create_default_provider() {
-    std::lock_guard<std::mutex> lock(g_trash_mutex);
-    if (!g_default_trash_provider) {
-#ifdef _WIN32
-        g_default_trash_provider = create_windows_recycle_bin();
+        instance = make_recycle_bin();
 #else
-        g_default_trash_provider = std::make_shared<FreeDesktopTrash>();
+        instance = make_freedesktop_trash();
 #endif
     }
-    return g_default_trash_provider;
-}
-
-} // namespace
-
-void set_default_trash_provider(std::shared_ptr<ITrashProvider> provider) {
-    std::lock_guard<std::mutex> lock(g_trash_mutex);
-    g_default_trash_provider = std::move(provider);
-}
-
-std::shared_ptr<ITrashProvider> get_default_trash_provider() {
-    return get_or_create_default_provider();
-}
-
-bool trash(const std::string& path, std::string* out_id) {
-    auto provider = get_or_create_default_provider();
-    if (provider) {
-        return provider->trash_path(path, out_id);
-    }
-    return false;
-}
-
-std::vector<TrashItem> list_trash() {
-    auto provider = get_or_create_default_provider();
-    if (provider) {
-        return provider->list_trash();
-    }
-    return {};
-}
-
-bool restore_trash(const std::string& id) {
-    auto provider = get_or_create_default_provider();
-    if (provider) {
-        return provider->restore_item(id);
-    }
-    return false;
-}
-
-bool delete_from_trash(const std::string& id) {
-    auto provider = get_or_create_default_provider();
-    if (provider) {
-        return provider->delete_item(id);
-    }
-    return false;
-}
-
-bool empty_trash() {
-    auto provider = get_or_create_default_provider();
-    if (provider) {
-        return provider->empty_trash();
-    }
-    return false;
+    return instance;
 }
 
 } // namespace bro::vfs

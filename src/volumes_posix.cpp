@@ -59,6 +59,23 @@ std::vector<VolumeInfo> list_volumes_platform() {
         if (!(ss >> device >> mount_point >> fs_type >> options)) {
             continue;
         }
+        // /proc/mounts escapes space, tab, newline and backslash as \ooo.
+        std::string decoded;
+        for (size_t i = 0; i < mount_point.size(); ++i) {
+            if (mount_point[i] == '\\' && i + 3 < mount_point.size()) {
+                decoded.push_back(static_cast<char>(std::stoi(mount_point.substr(i + 1, 3), nullptr, 8)));
+                i += 3;
+            } else {
+                decoded.push_back(mount_point[i]);
+            }
+        }
+        mount_point = decoded;
+        bool ro_option = false;
+        {
+            std::istringstream opts(options);
+            std::string opt;
+            while (std::getline(opts, opt, ',')) ro_option |= opt == "ro";
+        }
 
         if (is_pseudo_fs(fs_type)) {
             continue;
@@ -81,7 +98,7 @@ std::vector<VolumeInfo> list_volumes_platform() {
         info.total_bytes = static_cast<uint64_t>(st.f_blocks) * st.f_frsize;
         info.free_bytes = static_cast<uint64_t>(st.f_bfree) * st.f_frsize;
         info.available_bytes = static_cast<uint64_t>(st.f_bavail) * st.f_frsize;
-        info.is_read_only = (st.f_flag & ST_RDONLY) != 0 || (options.find("ro") != std::string::npos);
+        info.is_read_only = (st.f_flag & ST_RDONLY) != 0 || ro_option;
 
         if (device.find("/dev/sd") != std::string::npos || device.find("/dev/mmcblk") != std::string::npos) {
             if (mount_point.find("/media/") != std::string::npos || mount_point.find("/run/media/") != std::string::npos) {

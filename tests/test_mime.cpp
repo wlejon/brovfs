@@ -1,139 +1,101 @@
+// MIME sniffing by magic bytes, extension tables, and file-based sniffing on unicode paths.
 #include "brovfs/mime.h"
-#include <cassert>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <vector>
+#include "harness.h"
 
-#ifdef _WIN32
-#include <crtdbg.h>
-#include <cstdlib>
-#endif
+#include <initializer_list>
 
-namespace fs = std::filesystem;
+using namespace t;
+
+static std::string sniff(std::initializer_list<int> bytes) {
+    std::vector<uint8_t> v;
+    for (int b : bytes) v.push_back(static_cast<uint8_t>(b));
+    return vfs::sniff_mime_type(v);
+}
+
+static std::string sniff_text(std::string_view s) {
+    return vfs::sniff_mime_type(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
+}
+
+static std::vector<uint8_t> padded(std::initializer_list<int> head, size_t total = 64) {
+    std::vector<uint8_t> v;
+    for (int b : head) v.push_back(static_cast<uint8_t>(b));
+    v.resize(std::max(total, v.size()), 0);
+    return v;
+}
+
+static void test_signatures() {
+    section("images, audio, video");
+    CHECK(sniff({0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0}) == "image/png");
+    CHECK(sniff({0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, 'J', 'F', 'I', 'F'}) == "image/jpeg");
+    CHECK(sniff({'G', 'I', 'F', '8', '9', 'a', 1, 0, 1, 0}) == "image/gif");
+    CHECK(vfs::sniff_mime_type(padded({'B', 'M', 0x36, 0, 0, 0, 0, 0, 0, 0, 0x36, 0, 0, 0, 40, 0, 0, 0})) == "image/bmp");
+    CHECK(sniff({'R', 'I', 'F', 'F', 0x20, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', ' '}) == "image/webp");
+    CHECK(sniff({'q', 'o', 'i', 'f', 0, 0, 0, 0x20}) == "image/qoi");
+    CHECK(sniff({0, 0, 1, 0, 1, 0, 16, 16}) == "image/x-icon");
+    CHECK(sniff({'R', 'I', 'F', 'F', 0x24, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' '}) == "audio/wav");
+    CHECK(sniff({'f', 'L', 'a', 'C', 0, 0, 0, 0x22}) == "audio/flac");
+    CHECK(sniff({'I', 'D', '3', 4, 0, 0, 0, 0}) == "audio/mpeg");
+    CHECK(sniff({0, 0, 0, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 2, 0}) == "video/mp4");
+    CHECK(sniff({'R', 'I', 'F', 'F', 0x40, 0, 0, 0, 'A', 'V', 'I', ' ', 'L', 'I', 'S', 'T'}) == "video/x-msvideo");
+    CHECK(vfs::get_mime_category("image/png") == "image" && vfs::get_mime_category("audio/wav") == "audio");
+
+    section("fonts and 3D models");
+    CHECK(vfs::sniff_mime_type(padded({0x00, 0x01, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x80})) == "font/ttf");
+    CHECK(vfs::sniff_mime_type(padded({'t', 'r', 'u', 'e', 0x00, 0x0B})) == "font/ttf");
+    CHECK(vfs::sniff_mime_type(padded({'O', 'T', 'T', 'O', 0x00, 0x0C})) == "font/otf");
+    CHECK(vfs::sniff_mime_type(padded({'t', 't', 'c', 'f', 0x00, 0x01})) == "font/collection");
+    CHECK(vfs::sniff_mime_type(padded({'w', 'O', 'F', 'F', 0x00, 0x01, 0x00, 0x00})) == "font/woff");
+    CHECK(vfs::sniff_mime_type(padded({'w', 'O', 'F', '2', 0x00, 0x01, 0x00, 0x00})) == "font/woff2");
+    CHECK(vfs::sniff_mime_type(padded({'g', 'l', 'T', 'F', 2, 0, 0, 0, 0x40, 0, 0, 0})) == "model/gltf-binary");
+    CHECK(vfs::get_mime_category("font/woff2") == "font" && vfs::get_mime_category("model/gltf-binary") == "model");
+    CHECK(vfs::extension_to_mime(".GLB") == "model/gltf-binary" && vfs::extension_to_mime("woff2") == "font/woff2");
+    CHECK(vfs::mime_to_extension("font/otf") == "otf");
+    CHECK(sniff_text("%!PS-AdobeFont-1.0: C059-Bold 1.0\n") == "font/x-type1"); // PFA
+    CHECK(sniff({0x80, 0x01, 0x10, 0x00, 0x00, 0x00, '%', '!', 'P', 'S', '-', 'A', 'd', 'o', 'b', 'e', 'F', 'o', 'n',
+                 't', '-', '1', '.', '0'}) == "font/x-type1"); // PFB segment header
+    CHECK(vfs::extension_to_mime("pfb") == "font/x-type1");
+
+    section("false positives avoided");
+    CHECK(sniff_text("BMW parts list\nwheels: 4\n") == "text/plain"); // starts with "BM", not a bitmap
+    CHECK(vfs::sniff_mime_type(padded({0x00, 0x01, 0x00, 0x00, 0x00, 0x00})) != "font/ttf"); // zero tables
+    CHECK(vfs::sniff_mime_type(padded({'g', 'l', 'T', 'F', 1, 0, 0, 0})) != "model/gltf-binary");
+    CHECK(sniff_text("[Icon Theme]\nInherits=Adwaita\n") == "text/plain"); // INI, not JSON
+    CHECK(sniff_text("{name} says hi\n") == "text/plain");
+    CHECK(sniff_text("[1, 2, 3]") == "application/json" && sniff_text("[\n  {\"a\": true}\n]") == "application/json");
+    CHECK(sniff_text("%!PS-Adobe-3.0\n") == "application/postscript");
+
+    section("documents, archives, executables, text");
+    CHECK(sniff_text("%PDF-1.7\n%...") == "application/pdf");
+    CHECK(sniff({0x50, 0x4B, 0x03, 0x04, 0x14, 0x00}) == "application/zip");
+    CHECK(sniff({0x1F, 0x8B, 0x08, 0x00}) == "application/gzip");
+    CHECK(sniff({0x28, 0xB5, 0x2F, 0xFD, 0x00}) == "application/zstd");
+    CHECK(sniff({0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}) == "application/x-7z-compressed");
+    CHECK(sniff({0x7F, 'E', 'L', 'F', 2, 1, 1, 0}) == "application/x-elf");
+    CHECK(sniff({0x00, 'a', 's', 'm', 1, 0, 0, 0}) == "application/wasm");
+    CHECK(sniff_text("#!/usr/bin/env python3\nprint('hello')\n") == "text/x-python");
+    CHECK(sniff_text("  { \"name\": \"brovfs\" }\n") == "application/json");
+    CHECK(sniff_text("<!DOCTYPE html><html><body></body></html>") == "text/html");
+    CHECK(sniff_text("This is a simple plain text file.") == "text/plain");
+    CHECK(vfs::sniff_mime_type(std::span<const uint8_t>()) == "application/x-empty");
+    CHECK(vfs::get_mime_category("application/pdf") == "document" && vfs::get_mime_category("application/zip") == "archive");
+    CHECK(vfs::extension_to_mime("PDF") == "application/pdf" && vfs::extension_to_mime(".jpg") == "image/jpeg");
+    CHECK(vfs::extension_to_mime("nope") == "application/octet-stream" && vfs::mime_to_extension("x/y") == "bin");
+}
+
+static void test_files(const Scratch& s) {
+    section("file sniffing through unicode paths");
+    fs::path f = s / p8("画像 ü.png");
+    const char png[] = {'\x89', 'P', 'N', 'G', '\r', '\n', '\x1a', '\n', 0, 0, 0, 0};
+    write_file(f, std::string(png, sizeof(png)));
+    CHECK(vfs::sniff_mime_type_from_file(f) == "image/png");
+    write_file(s / "empty.bin", "");
+    CHECK(vfs::sniff_mime_type_from_file(s / "empty.bin") == "application/x-empty");
+    CHECK(vfs::sniff_mime_type_from_file(s / "missing.bin") == "application/octet-stream");
+}
 
 int main() {
-#ifdef _WIN32
-    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-#endif
-
-    std::cout << "[test_mime] Testing image magic bytes..." << std::endl;
-    // PNG
-    const uint8_t png_data[] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00};
-    assert(bro::vfs::sniff_mime_type(png_data) == "image/png");
-    assert(bro::vfs::get_mime_category("image/png") == "image");
-
-    // JPEG
-    const uint8_t jpeg_data[] = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46};
-    assert(bro::vfs::sniff_mime_type(jpeg_data) == "image/jpeg");
-
-    // GIF
-    const uint8_t gif_data[] = {'G', 'I', 'F', '8', '9', 'a', 0x01, 0x00, 0x01, 0x00};
-    assert(bro::vfs::sniff_mime_type(gif_data) == "image/gif");
-
-    // BMP
-    const uint8_t bmp_data[] = {'B', 'M', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    assert(bro::vfs::sniff_mime_type(bmp_data) == "image/bmp");
-
-    // WebP
-    const uint8_t webp_data[] = {'R', 'I', 'F', 'F', 0x20, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P', 'V', 'P', '8', ' '};
-    assert(bro::vfs::sniff_mime_type(webp_data) == "image/webp");
-
-    // QOI
-    const uint8_t qoi_data[] = {'q', 'o', 'i', 'f', 0x00, 0x00, 0x00, 0x20};
-    assert(bro::vfs::sniff_mime_type(qoi_data) == "image/qoi");
-
-    std::cout << "[test_mime] Testing audio and video magic bytes..." << std::endl;
-    // WAV
-    const uint8_t wav_data[] = {'R', 'I', 'F', 'F', 0x24, 0x00, 0x00, 0x00, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' '};
-    assert(bro::vfs::sniff_mime_type(wav_data) == "audio/wav");
-    assert(bro::vfs::get_mime_category("audio/wav") == "audio");
-
-    // FLAC
-    const uint8_t flac_data[] = {'f', 'L', 'a', 'C', 0x00, 0x00, 0x00, 0x22};
-    assert(bro::vfs::sniff_mime_type(flac_data) == "audio/flac");
-
-    // MP3 (ID3)
-    const uint8_t mp3_data[] = {'I', 'D', '3', 0x04, 0x00, 0x00, 0x00, 0x00};
-    assert(bro::vfs::sniff_mime_type(mp3_data) == "audio/mpeg");
-
-    // MP4
-    const uint8_t mp4_data[] = {0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0x00, 0x00, 0x02, 0x00};
-    assert(bro::vfs::sniff_mime_type(mp4_data) == "video/mp4");
-    assert(bro::vfs::get_mime_category("video/mp4") == "video");
-
-    // AVI
-    const uint8_t avi_data[] = {'R', 'I', 'F', 'F', 0x40, 0x00, 0x00, 0x00, 'A', 'V', 'I', ' ', 'L', 'I', 'S', 'T'};
-    assert(bro::vfs::sniff_mime_type(avi_data) == "video/x-msvideo");
-
-    std::cout << "[test_mime] Testing documents, archives, executables..." << std::endl;
-    // PDF
-    const uint8_t pdf_data[] = "%PDF-1.7\n%...";
-    assert(bro::vfs::sniff_mime_type(std::span<const uint8_t>(pdf_data, sizeof(pdf_data) - 1)) == "application/pdf");
-    assert(bro::vfs::get_mime_category("application/pdf") == "document");
-
-    // ZIP
-    const uint8_t zip_data[] = {0x50, 0x4B, 0x03, 0x04, 0x14, 0x00};
-    assert(bro::vfs::sniff_mime_type(zip_data) == "application/zip");
-    assert(bro::vfs::get_mime_category("application/zip") == "archive");
-
-    // GZIP
-    const uint8_t gz_data[] = {0x1F, 0x8B, 0x08, 0x00};
-    assert(bro::vfs::sniff_mime_type(gz_data) == "application/gzip");
-
-    // ZSTD
-    const uint8_t zstd_data[] = {0x28, 0xB5, 0x2F, 0xFD, 0x00};
-    assert(bro::vfs::sniff_mime_type(zstd_data) == "application/zstd");
-
-    // 7-Zip
-    const uint8_t seven_zip_data[] = {0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C};
-    assert(bro::vfs::sniff_mime_type(seven_zip_data) == "application/x-7z-compressed");
-
-    // ELF
-    const uint8_t elf_data[] = {0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00};
-    assert(bro::vfs::sniff_mime_type(elf_data) == "application/x-elf");
-    assert(bro::vfs::get_mime_category("application/x-elf") == "executable");
-
-    // WASM
-    const uint8_t wasm_data[] = {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00};
-    assert(bro::vfs::sniff_mime_type(wasm_data) == "application/wasm");
-
-    // Shebang python
-    const uint8_t py_script[] = "#!/usr/bin/env python3\nprint('hello')\n";
-    assert(bro::vfs::sniff_mime_type(std::span<const uint8_t>(py_script, sizeof(py_script) - 1)) == "text/x-python");
-    assert(bro::vfs::get_mime_category("text/x-python") == "code");
-
-    // JSON
-    const uint8_t json_data[] = "  { \"name\": \"brovfs\" }\n";
-    assert(bro::vfs::sniff_mime_type(std::span<const uint8_t>(json_data, sizeof(json_data) - 1)) == "application/json");
-
-    // HTML
-    const uint8_t html_data[] = "<!DOCTYPE html><html><body></body></html>";
-    assert(bro::vfs::sniff_mime_type(std::span<const uint8_t>(html_data, sizeof(html_data) - 1)) == "text/html");
-
-    // Plain text
-    const uint8_t txt_data[] = "This is a simple plain text file without any binary bytes.";
-    assert(bro::vfs::sniff_mime_type(std::span<const uint8_t>(txt_data, sizeof(txt_data) - 1)) == "text/plain");
-
-    std::cout << "[test_mime] Testing file-based sniffing..." << std::endl;
-    fs::path temp_file = fs::current_path() / "test_scratch_mime.png";
-    {
-        std::ofstream out(temp_file, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(png_data), sizeof(png_data));
-    }
-    assert(bro::vfs::sniff_mime_type_from_file(temp_file.generic_string()) == "image/png");
-    std::error_code ec;
-    fs::remove(temp_file, ec);
-
-    std::cout << "[test_mime] Testing extension lookup..." << std::endl;
-    assert(bro::vfs::extension_to_mime("png") == "image/png");
-    assert(bro::vfs::extension_to_mime(".jpg") == "image/jpeg");
-    assert(bro::vfs::extension_to_mime("PDF") == "application/pdf");
-    assert(bro::vfs::mime_to_extension("image/png") == "png");
-    assert(bro::vfs::mime_to_extension("application/pdf") == "pdf");
-
-    std::cout << "[test_mime] All MIME tests passed successfully!" << std::endl;
-    return 0;
+    Scratch s("mime");
+    test_signatures();
+    test_files(s);
+    return finish("test_mime");
 }

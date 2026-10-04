@@ -1,55 +1,57 @@
 # brovfs
 
-High-performance, non-blocking Desktop Virtual Filesystem and File Operations Engine for Bro (`bro.vfs`).
+File-operations substrate for a desktop file manager: scanning, copy/move/remove, trash,
+volumes and MIME sniffing. A standalone C++20 library with no dependencies beyond the OS
+(no bro, no bronze, no Qt/GLib), Windows and Linux.
 
-`brovfs` powers Bro's desktop file explorer, system file pickers, and desktop shell. Unlike general-purpose libraries, `brovfs` is built specifically for desktop file managers and shell applications:
-- **Asynchronous batch directory streaming off-thread** without stalling the UI loop.
-- **Background recursive file copy/move/delete jobs** with real-time byte progress, speed estimation, ETA, pause, resume, and cancellation tokens.
-- **Conflict resolution policies** (Overwrite, Skip, AutoRename, KeepNewer).
-- **FreeDesktop Trash specification & Windows Shell Recycle Bin** undo support.
-- **Linux CoW (reflink) file cloning** (`copy_file_range(2)` and `ioctl(FICLONE)`) with streaming fallback.
-- **Volume and drive enumeration** (`statvfs` on Linux, `GetDiskFreeSpaceExW` / `GetLogicalDriveStringsW` on Windows).
-- **Instant magic-byte MIME sniffing** from the first 512 bytes for all desktop file types.
+The first duty is never to lose data:
 
----
+- Every operation is planned against a scanned, no-follow model of the source and checked
+  by file identity (device + inode / volume serial + 128-bit file ID) before it acts.
+- Files are written to a temp sibling (`.brovfs-<hex>.tmp`), synced, and committed with a
+  no-replace rename (or replace, only when the caller chose Overwrite).
+- A move renames when it can. Only a cross-device error falls back to copy, and a source is
+  deleted only after its destination is committed and the source still matches the plan.
+  Source directories are removed with `rmdir` only.
+- Links are copied, moved and removed as links; deleting a junction or symlink never
+  touches its target.
+- Conflicts are surfaced (`ConflictPolicy`, or a `ConflictResolver` callback with
+  `Ask`); same-file and type-mismatch overwrites are refused.
+- Results are per item: `OpResult` reports Success / Partial / Failed / Cancelled with
+  every error and warning.
 
-## Architecture & Subsystems
+## Headers
 
-- `include/brovfs/scanner.h` (`async_scanner`):
-  Non-blocking directory enumeration off-thread with batched callbacks. Leverages `FindFirstFileExW` with `FIND_FIRST_EX_LARGE_FETCH` on Windows and `opendir`/`readdir` on POSIX without per-item `stat()` calls.
-- `include/brovfs/file_ops.h` (`file_ops_worker`):
-  Standalone copy, move, and delete routines, plus `FileOpsWorker` - a managed background job queue with pause, resume, cancel, and ETA computation.
-- `include/brovfs/reflink.h` (`reflink_cow`):
-  Zero-cost CoW file cloning via Btrfs/XFS/ZFS `FICLONE` with transparent fast streaming fallback.
-- `include/brovfs/trash.h` & `trash_freedesktop.h` (`trash`):
-  Full FreeDesktop.org Trash specification implementation (`$XDG_DATA_HOME/Trash/{files,info}`) with collision resolution and `.trashinfo` metadata, plus Windows Recycle Bin integration.
-- `include/brovfs/volumes.h` (`volumes`):
-  Mount point discovery, filesystem types, capacity, and usage metrics across Windows drives and Linux mounts.
-- `include/brovfs/mime.h` (`mime_sniffer`):
-  Magic-byte identification from first 512 bytes for desktop images, audio, video, documents, archives, and binaries.
-- `include/brovfs/vfs.h`:
-  Convenient unified entry point.
-
----
+- `brovfs/path.h`: UTF-8 (WTF-8 on Windows) path conversion, `\\?\` long paths.
+- `brovfs/scanner.h`: sync, streamed and async directory scans with per-entry errors
+  (getdents64 + statx on Linux; FileIdExtdDirectoryInfo on Windows).
+- `brovfs/file_ops.h`: `copy_into/to`, `move_into/to`, `remove`, `clone_file`
+  (FICLONE reflink, then copy_file_range, then streaming; the method used is reported).
+- `brovfs/worker.h`: `FileOpsWorker` background job queue with progress, pause, resume
+  and cancel.
+- `brovfs/trash.h`: freedesktop.org trash per spec (home trash, `$topdir/.Trash/$uid`,
+  `$topdir/.Trash-$uid`, directorysizes) and the Windows Recycle Bin (shell recycle that
+  refuses rather than permanently deleting; listing, restore and erase from `$I` records).
+- `brovfs/volumes.h`: mounted volumes, capacity, read-only state.
+- `brovfs/mime.h`: magic-byte MIME sniffing (images, audio, video, documents,
+  archives, fonts, glTF/glb, ...).
+- `brovfs/vfs.h`: umbrella header.
 
 ## Building
 
-Modern C++20 compiler required. No external dependencies (no Qt, no GLib).
-
 ```bash
-# Configure
-cmake -B build -G "Visual Studio 17 2022" -A x64
+# Windows (Visual Studio generator)
+cmake -B build -DBROVFS_BUILD_TESTS=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 
-# Build
-cmake --build build --config Debug
-
-# Run tests
-ctest --test-dir build -C Debug --output-on-failure
+# Linux
+cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROVFS_BUILD_TESTS=ON
+cmake --build build-release && ctest --test-dir build-release --output-on-failure
 ```
 
----
-
-## Coding Guidelines
-
-- Every source file is strictly under 1,000 lines.
-- Memory safe, RAII wrappers, clean Modern C++20 idioms.
+The tests use the real file system, only inside scratch directories they create
+(`BROVFS_TEST_SCRATCH`, default `./brovfs-scratch`). Cross-device cases use
+`BROVFS_TEST_SCRATCH2` (default: `%TEMP%` on Windows, `/dev/shm` on Linux, when it is a
+different device). The Windows trash test uses the real Recycle Bin but touches only
+items it created itself.

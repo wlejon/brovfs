@@ -1,19 +1,12 @@
 #pragma once
 
-#include "brovfs/version.h"
-#include "brovfs/types.h"
-#include "brovfs/scanner.h"
+// Umbrella header.
 #include "brovfs/file_ops.h"
-#include "brovfs/reflink.h"
-#include "brovfs/trash.h"
-#include "brovfs/trash_freedesktop.h"
-#include "brovfs/volumes.h"
 #include "brovfs/mime.h"
-
-namespace bro::vfs {
-
-// Library initialization / teardown if needed (currently stateless)
-inline void init() {}
-inline void shutdown() {}
-
-} // namespace bro::vfs
+#include "brovfs/path.h"
+#include "brovfs/scanner.h"
+#include "brovfs/trash.h"
+#include "brovfs/types.h"
+#include "brovfs/version.h"
+#include "brovfs/volumes.h"
+#include "brovfs/worker.h"
