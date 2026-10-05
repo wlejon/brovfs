@@ -181,7 +181,6 @@ CopyMethod copy_file_data(const fs::path& src, const Stat& src_st, const fs::pat
     }
     // Verify: the written size must equal the source as it is now. (Whether the source still
     // matches the plan is the transfer layer's question.)
-    (void)src_st;
     Stat now_src, out;
     std::error_code sec;
     auto fail = [&](std::error_code e) {
@@ -211,7 +210,7 @@ CopyMethod copy_file_data(const fs::path& src, const Stat& src_st, const fs::pat
         if (ro) SetFileAttributesW(dw.c_str(), attrs);
         if (!flushed) return fail(fe);
     }
-    if (!hooks.preserve_metadata) {
+    if (!hooks.meta.enabled) {
         // CopyFile2 always carries attributes and times over; reset times to "now" to honour
         // the option (attributes such as read-only stay, as Explorer does).
         Handle h = open_nofollow(dst, FILE_WRITE_ATTRIBUTES);
@@ -220,11 +219,25 @@ CopyMethod copy_file_data(const fs::path& src, const Stat& src_st, const fs::pat
         GetSystemTimeAsFileTime(&ft);
         bi.LastWriteTime.QuadPart = ft64(ft);
         if (h.ok()) SetFileInformationByHandle(h.get(), FileBasicInfo, &bi, sizeof(bi));
+    } else {
+        // CopyFile2 keeps the write time, attributes, streams and EAs but stamps a new
+        // creation time; the security descriptor follows only when asked.
+        std::error_code bec;
+        if (!set_birth_time(dst, src_st.btime_ns, bec) && hooks.warnings) {
+            hooks.warnings->push_back({{}, dst, bec, "set creation time"});
+        }
+        if (hooks.meta.acls) copy_security(src, dst, hooks.meta.owner, hooks.warnings);
     }
     return CopyMethod::KernelCopy;
 }
 
-void apply_metadata(const fs::path& dst, const Stat& st, std::vector<ItemError>* warnings) {
+void apply_metadata(const fs::path& src, const fs::path& dst, const Stat& st, const MetaOptions& meta,
+                    std::vector<ItemError>* warnings) {
+    if (!meta.enabled) return;
+    if (st.kind == FileKind::Directory) {
+        if (meta.xattrs) copy_streams(src, dst, warnings);
+        if (meta.acls) copy_security(src, dst, meta.owner, warnings);
+    }
     Handle h = open_nofollow(dst, FILE_WRITE_ATTRIBUTES);
     if (!h.ok()) {
         if (warnings) warnings->push_back({{}, dst, last_error(), "set attributes"});

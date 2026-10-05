@@ -13,6 +13,10 @@
 #endif
 #include <windows.h>
 #endif
+#ifdef __APPLE__
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 
 namespace bro::vfs {
 
@@ -45,6 +49,16 @@ std::optional<VolumeInfo> get_volume_for_path(const fs::path& path) {
         if (parent.empty() || parent == probe) return std::nullopt;
         probe = parent;
     }
+#ifdef __APPLE__
+    // Firmlinks (/Users, /Applications, ... on the Data volume) make path containment lie;
+    // the kernel names the mount that holds the object.
+    struct statfs sf {};
+    if (::statfs(probe.c_str(), &sf) == 0) {
+        for (auto& v : volumes) {
+            if (v.mount_point == fs::path(sf.f_mntonname)) return v;
+        }
+    }
+#endif
     // Bind mounts share a device: prefer the deepest same-device mount that contains the
     // canonical path, and only then any same-device mount.
     fs::path real = fs::canonical(probe, ec);

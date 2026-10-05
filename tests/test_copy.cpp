@@ -67,8 +67,11 @@ static void test_overwrite_cancel(const Scratch& s) {
     fs::path dst = s / "ow" / "dst.txt";
     write_big(src, 32ull << 20);
     write_file(dst, "existing destination");
+    // A clone is one step with nothing to cancel part-way, so this exercises the data copy.
+    vfs::FileOpOptions ow = policy(vfs::ConflictPolicy::Overwrite);
+    ow.allow_reflink = false;
     int calls = 0;
-    auto r = vfs::copy_to(src, dst, policy(vfs::ConflictPolicy::Overwrite), [&](const vfs::ProgressInfo& p) {
+    auto r = vfs::copy_to(src, dst, ow, [&](const vfs::ProgressInfo& p) {
         return p.bytes_processed == 0 || ++calls < 2;
     });
     CHECK_MSG(r.outcome == vfs::Outcome::Cancelled, describe(r));
@@ -76,7 +79,7 @@ static void test_overwrite_cancel(const Scratch& s) {
     CHECK(temps_left(s / "ow") == 0);
 
     auto token = std::make_shared<vfs::CancellationToken>();
-    r = vfs::copy_to(src, dst, policy(vfs::ConflictPolicy::Overwrite), [&](const vfs::ProgressInfo& p) {
+    r = vfs::copy_to(src, dst, ow, [&](const vfs::ProgressInfo& p) {
         if (p.bytes_processed > (4u << 20)) token->cancel();
         return true;
     }, token);
@@ -371,6 +374,14 @@ static void test_clone(const Scratch& s) {
         CHECK(strict.ok() && strict.method == vfs::CopyMethod::Reflink);
     } else {
         CHECK(strict.error == std::errc::operation_not_supported && !path_exists(s / "clone" / "strict.bin"));
+    }
+#ifdef __APPLE__
+    CHECK_MSG(cow, "APFS scratch expected to support clonefile");
+#endif
+    if (cow && strict.ok()) {
+        // A clone shares blocks, not identity: writing it leaves the source untouched.
+        write_file(s / "clone" / "strict.bin", "rewritten");
+        CHECK(read_file(s / "clone" / "strict.bin") == "rewritten" && same_content(src, s / "clone" / "dst.bin"));
     }
     auto again = vfs::clone_file(src, s / "clone" / "dst.bin");
     CHECK(again.error == std::errc::file_exists && same_content(src, s / "clone" / "dst.bin"));

@@ -18,6 +18,7 @@ struct Stat {
     int64_t mtime_ns = 0;
     int64_t atime_ns = 0;
     int64_t btime_ns = 0;   // 0 when unknown
+    int64_t ctime_ns = 0;   // status change time (POSIX ctime / NTFS ChangeTime); 0 when unknown
     uint32_t mode = 0;      // POSIX st_mode
     uint32_t uid = 0, gid = 0;
     uint32_t attributes = 0; // Windows FILE_ATTRIBUTE_*
@@ -45,6 +46,47 @@ struct RawEntry {
 // from the callback to stop. Returns false with ec set if the directory could not be read
 // (entries already delivered stay valid).
 bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, std::error_code& ec);
+
+// An open directory, for traversal and removal relative to a handle instead of a path: once a
+// directory is open, swapping one of its ancestors (for a link, or a different tree) cannot
+// redirect what is listed, opened or deleted beneath it.
+//   POSIX: an O_DIRECTORY fd; children via openat / fstatat / unlinkat with AT_SYMLINK_NOFOLLOW.
+//   Windows: a directory HANDLE; children via NtCreateFile relative to it with
+//   FILE_OPEN_REPARSE_POINT, and identity checked on the child's own handle before deleting.
+class Dir {
+public:
+    Dir() = default;
+    ~Dir();
+    Dir(Dir&& o) noexcept;
+    Dir& operator=(Dir&& o) noexcept;
+    Dir(const Dir&) = delete;
+    Dir& operator=(const Dir&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept;
+    void close() noexcept;
+
+    // Opens the directory `p`. With follow_leaf=false a link at `p` itself is refused (ELOOP /
+    // not_a_directory); links in earlier components are followed as the caller spelled them.
+    static bool open(const fs::path& p, bool follow_leaf, Dir& out, std::error_code& ec);
+    // Opens child directory `name` (one component) without following a link. With `expect`,
+    // fails with Errc::source_changed unless the opened directory has that identity.
+    bool open_child(const fs::path& name, const FileId* expect, Dir& out, std::error_code& ec) const;
+    bool stat(Stat& out, std::error_code& ec) const;
+    bool stat_child(const fs::path& name, Stat& out, std::error_code& ec) const;
+    // Lists from the start; see list_dir.
+    bool list(const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) const;
+    // Deletes child `name`: an empty directory when `is_dir`, else a non-directory (a link is
+    // deleted as a link). With `expect` the object must have that identity (Windows: checked on
+    // the handle that deletes it; POSIX: fstatat immediately before unlinkat in this directory).
+    bool remove_child(const fs::path& name, bool is_dir, const FileId* expect, std::error_code& ec) const;
+
+private:
+#ifdef _WIN32
+    void* h_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+};
 
 bool read_link_target(const fs::path& link, std::string& target_utf8, std::error_code& ec);
 
@@ -75,6 +117,14 @@ bool copy_link(const fs::path& src, const Stat& src_st, const fs::path& dst, std
 // Recreate a FIFO; other special files fail with unsupported_file_type.
 bool copy_special(const Stat& src_st, const fs::path& dst, std::error_code& ec);
 
+// Which metadata travels with a copy (see FileOpOptions).
+struct MetaOptions {
+    bool enabled = true; // times, mode, attributes; false = none of this struct
+    bool xattrs = true;
+    bool acls = false;
+    bool owner = true;
+};
+
 struct DataCopyHooks {
     // Bytes copied since last call; return false to cancel (copy fails with Errc::cancelled).
     std::function<bool(uint64_t delta)> on_chunk;
@@ -82,7 +132,7 @@ struct DataCopyHooks {
     bool require_reflink = false; // fail with operation_not_supported unless a CoW clone happened
     bool allow_kernel_copy = true;
     bool sync = false;
-    bool preserve_metadata = true;
+    MetaOptions meta;
     size_t buffer_size = 1u << 20;
     std::vector<ItemError>* warnings = nullptr; // metadata failures
 };
@@ -93,8 +143,30 @@ struct DataCopyHooks {
 CopyMethod copy_file_data(const fs::path& src, const Stat& src_st, const fs::path& dst,
                           const DataCopyHooks& hooks, uint64_t& bytes_copied, std::error_code& ec);
 
-// Times / mode / attributes of a directory or link after its contents are in place.
-void apply_metadata(const fs::path& dst, const Stat& src_st, std::vector<ItemError>* warnings);
+// Metadata of a directory, link or special file after its contents are in place: times,
+// mode/attributes, and per `meta` xattrs (Windows: alternate data streams of a directory),
+// ACLs / security descriptor and ownership. `src` is read for xattrs / ACLs.
+void apply_metadata(const fs::path& src, const fs::path& dst, const Stat& src_st, const MetaOptions& meta,
+                    std::vector<ItemError>* warnings);
+
+// macOS ACL entries can deny `delete`, which also forbids renaming the object, so the ACL of
+// a staged non-directory is applied after its commit rename: stage with staged_meta(), then
+// call apply_acl_committed on the final name. Elsewhere the ACL is part of staging.
+#ifdef __APPLE__
+inline MetaOptions staged_meta(MetaOptions m) {
+    m.acls = false;
+    return m;
+}
+void apply_acl_committed(const fs::path& src, const fs::path& dst, const Stat& src_st, const MetaOptions& meta,
+                         std::vector<ItemError>* warnings);
+#else
+inline MetaOptions staged_meta(MetaOptions m) { return m; }
+inline void apply_acl_committed(const fs::path&, const fs::path&, const Stat&, const MetaOptions&,
+                                std::vector<ItemError>*) {}
+#endif
+
+// A new hard link `link` to the existing non-directory `target` (no-follow on both).
+bool make_hard_link(const fs::path& target, const fs::path& link, std::error_code& ec);
 
 // Make a completed rename durable (POSIX: fsync the directory; Windows: no-op, handled by
 // MOVEFILE_WRITE_THROUGH / FlushFileBuffers).

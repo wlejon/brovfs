@@ -12,7 +12,9 @@
 
 #include "brovfs/path.h"
 
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace bro::vfs::detail {
@@ -282,9 +284,51 @@ private:
 
     // ------------------------------------------------------------ copy (and cross-device move)
 
-    // Copy content of one non-directory into a temp sibling of `tmp`'s final name.
-    bool stage(const fs::path& src, const sys::Stat& st, const fs::path& tmp, const fs::path& dst, bool remove_source) {
+    sys::MetaOptions meta() const {
+        sys::MetaOptions m;
+        m.enabled = opt_.preserve_metadata;
+        m.xattrs = opt_.preserve_xattrs;
+        m.acls = opt_.preserve_acls;
+        m.owner = opt_.preserve_owner;
+        return m;
+    }
+
+    // ------------------------------------------------------------ hard-link sets
+
+    using LinkKey = std::tuple<uint64_t, uint64_t, uint64_t>;
+    static LinkKey link_key(const sys::Stat& st) { return {st.id.device, st.id.hi, st.id.lo}; }
+
+    // Whether `st` (a regular file) belongs to a hard-link set; fills a link count the
+    // directory listing could not provide (Windows enumerations carry none).
+    bool in_link_set(const fs::path& src, sys::Stat& st) {
+        if (!opt_.preserve_hard_links || st.kind != FileKind::Regular || !st.id.valid) return false;
+        if (st.nlink == 0) {
+            sys::Stat now;
+            std::error_code ec;
+            if (sys::lstat(src, now, ec) && now.id == st.id) st.nlink = now.nlink;
+        }
+        return st.nlink > 1;
+    }
+
+    // Copy content of one non-directory into a temp sibling of `tmp`'s final name. With
+    // `link_to`, first try to make `tmp` a hard link of that earlier copy of the same file.
+    bool stage(const fs::path& src, const sys::Stat& st, const fs::path& tmp, const fs::path& dst, bool remove_source,
+               const fs::path* link_to) {
         std::error_code ec;
+        if (link_to && sys::make_hard_link(*link_to, tmp, ec)) {
+            sys::Stat a, b;
+            std::error_code e1, e2;
+            if (sys::lstat(tmp, a, e1) && sys::lstat(*link_to, b, e2) && a.id == b.id && a.size == st.size) {
+                if (!prog_.bytes(st.size)) {
+                    sys::remove_nondir(tmp, e1);
+                    return false;
+                }
+                ++res_.hard_linked;
+                return true;
+            }
+            sys::remove_nondir(tmp, e1); // the earlier copy changed meanwhile: copy instead
+        }
+        ec.clear();
         switch (st.kind) {
             case FileKind::Regular: {
                 sys::DataCopyHooks hooks;
@@ -292,7 +336,7 @@ private:
                 hooks.allow_reflink = opt_.allow_reflink;
                 hooks.allow_kernel_copy = opt_.allow_kernel_copy;
                 hooks.sync = opt_.sync || remove_source;
-                hooks.preserve_metadata = opt_.preserve_metadata;
+                hooks.meta = sys::staged_meta(meta());
                 hooks.buffer_size = opt_.buffer_size;
                 hooks.warnings = &res_.warnings;
                 uint64_t n = 0;
@@ -318,22 +362,25 @@ private:
                     fail(src, dst, ec, "create link");
                     return false;
                 }
-                if (opt_.preserve_metadata) sys::apply_metadata(tmp, st, &res_.warnings);
+                sys::apply_metadata(src, tmp, st, sys::staged_meta(meta()), &res_.warnings);
                 return true;
             default:
                 if (!sys::copy_special(st, tmp, ec)) {
                     fail(src, dst, ec, "create");
                     return false;
                 }
-                if (opt_.preserve_metadata) sys::apply_metadata(tmp, st, &res_.warnings);
+                sys::apply_metadata(src, tmp, st, sys::staged_meta(meta()), &res_.warnings);
                 return true;
         }
     }
 
-    bool remove_moved_source(const fs::path& src, const sys::Stat& planned) {
+    // Deletes a moved non-directory once its copy is committed, if it still matches the plan.
+    // Through `parent` (the source's directory handle) when the caller has one.
+    bool remove_moved_source(const fs::path& src, const sys::Stat& planned, const sys::Dir* parent) {
         sys::Stat now;
         std::error_code ec;
-        if (!sys::lstat(src, now, ec)) {
+        const fs::path name = src.filename();
+        if (!(parent ? parent->stat_child(name, now, ec) : sys::lstat(src, now, ec))) {
             fail(src, {}, ec, "verify source");
             return false;
         }
@@ -342,15 +389,15 @@ private:
             fail(src, {}, make_error_code(Errc::source_changed), "remove source");
             return false;
         }
-        if (!sys::remove_nondir(src, ec, &planned.id)) {
+        if (!(parent ? parent->remove_child(name, false, &planned.id, ec) : sys::remove_nondir(src, ec, &planned.id))) {
             fail(src, {}, ec, "remove source");
             return false;
         }
         return true;
     }
 
-    ItemState place_nondir(const fs::path& src, const sys::Stat& st, fs::path dst, bool remove_source,
-                           bool preset_overwrite, fs::path* final_dst) {
+    ItemState place_nondir(const fs::path& src, sys::Stat st, fs::path dst, bool remove_source, bool preset_overwrite,
+                           fs::path* final_dst, const sys::Dir* src_parent) {
         if (st.kind == FileKind::Socket || st.kind == FileKind::CharDevice || st.kind == FileKind::BlockDevice ||
             st.kind == FileKind::Unknown) {
             fail(src, dst, make_error_code(Errc::unsupported_file_type), "copy");
@@ -381,7 +428,15 @@ private:
             const bool overwrite = r.act == Resolution::Overwrite;
             fs::path parent = dst.parent_path();
             fs::path tmp = sys::temp_sibling(parent.empty() ? fs::path(".") : parent);
-            if (!stage(src, st, tmp, dst, remove_source)) {
+            // A file whose identity already has a copy joins it (a move may have deleted the
+            // other names already, so the current link count is not asked first).
+            const fs::path* link_to = nullptr;
+            if (opt_.preserve_hard_links && st.kind == FileKind::Regular && st.id.valid) {
+                auto it = links_.find(link_key(st));
+                if (it != links_.end()) link_to = &it->second;
+            }
+            const bool linked = link_to || in_link_set(src, st);
+            if (!stage(src, st, tmp, dst, remove_source, link_to)) {
                 return stop() ? ItemState::Pending : ItemState::Failed;
             }
             std::error_code ec;
@@ -394,10 +449,12 @@ private:
                 return ItemState::Failed;
             }
             count(st);
+            if (!link_to && meta().enabled && meta().acls) sys::apply_acl_committed(src, dst, st, meta(), &res_.warnings);
+            if (linked && !link_to) links_.emplace(link_key(st), dst);
             if (final_dst) *final_dst = dst;
             if (remove_source) {
                 sys::sync_dir(parent);
-                if (!remove_moved_source(src, st)) return ItemState::Failed;
+                if (!remove_moved_source(src, st, src_parent)) return ItemState::Failed;
             }
             return ItemState::Done;
         }
@@ -455,15 +512,34 @@ private:
 
     void copy_tree(const fs::path& src, const sys::Stat& ss, const fs::path& dst, bool remove_source,
                    bool preset_overwrite, bool top) {
+        // For a move, the source side is acted on through its parent's handle.
+        sys::Dir src_parent;
+        if (remove_source) {
+            std::error_code ec;
+            if (!sys::Dir::open(src.parent_path(), true, src_parent, ec)) {
+                fail(src, dst, ec, "open source");
+                return;
+            }
+        }
         if (ss.kind != FileKind::Directory) {
             prog_.add_totals(ss.kind == FileKind::Regular ? ss.size : 0, 1);
             if (!prog_.begin_item(src)) return;
             fs::path final_dst;
-            if (place_nondir(src, ss, dst, remove_source, preset_overwrite, &final_dst) == ItemState::Done && top) {
+            if (place_nondir(src, ss, dst, remove_source, preset_overwrite, &final_dst,
+                             remove_source ? &src_parent : nullptr) == ItemState::Done &&
+                top) {
                 res_.created.push_back(final_dst);
             }
             prog_.end_item();
             return;
+        }
+        sys::Dir src_root;
+        if (remove_source) {
+            std::error_code ec;
+            if (!src_parent.open_child(src.filename(), &ss.id, src_root, ec)) {
+                fail(src, dst, ec, "open source");
+                return;
+            }
         }
 
         // Plan.
@@ -504,6 +580,19 @@ private:
         if (top && root_created) res_.created.push_back(root_dst);
         prog_.end_item();
 
+        // Source directories of a move, reopened relative to each other and checked against
+        // the plan: a deletion can only ever name an entry of the planned directory.
+        DirChain chain(
+            std::move(src_root), [&](int64_t i) { return nodes[static_cast<size_t>(i)].parent; },
+            [&](int64_t i) { return nodes[static_cast<size_t>(i)].leaf; },
+            [&](int64_t i) { return nodes[static_cast<size_t>(i)].st.id; });
+        auto source_dir = [&](const Node& nd) -> const sys::Dir* {
+            std::error_code ec;
+            const sys::Dir* d = chain.get(nd.parent, ec);
+            if (!d) fail(nd.parent < 0 ? src : nodes[static_cast<size_t>(nd.parent)].src, {}, ec, "open source");
+            return d;
+        };
+
         // Execute in pre-order: parents exist before children.
         const size_t n = nodes.size();
         std::vector<ItemState> state(n, ItemState::Pending);
@@ -527,7 +616,12 @@ private:
                 created[i] = cr;
                 if (state[i] == ItemState::Done) ++res_.dirs_done;
             } else {
-                state[i] = place_nondir(nd.src, nd.st, dsts[i], remove_source, false, nullptr);
+                const sys::Dir* sd = remove_source ? source_dir(nd) : nullptr;
+                if (remove_source && !sd) {
+                    state[i] = ItemState::Failed; // nothing copied that could not then be removed
+                } else {
+                    state[i] = place_nondir(nd.src, nd.st, dsts[i], remove_source, false, nullptr, sd);
+                }
             }
             prog_.end_item();
         }
@@ -549,28 +643,34 @@ private:
                 continue;
             }
             if (nd.st.kind != FileKind::Directory) continue;
-            if (created[k] && opt_.preserve_metadata) sys::apply_metadata(dsts[k], nd.st, &res_.warnings);
+            if (created[k]) sys::apply_metadata(nd.src, dsts[k], nd.st, meta(), &res_.warnings);
             if (!remove_source) continue;
             if (blocked[k] || nd.incomplete || stop()) {
                 block_parent(nd);
                 continue;
             }
+            const sys::Dir* sd = source_dir(nd);
             std::error_code ec;
-            if (!sys::remove_dir(nd.src, ec, &nd.st.id)) {
+            if (!sd) {
+                block_parent(nd);
+            } else if (!sd->remove_child(nd.leaf, true, &nd.st.id, ec)) {
                 fail(nd.src, {}, sys::is_exists_error(ec) ? make_error_code(Errc::directory_not_empty_after_move) : ec,
                      "remove source");
                 block_parent(nd);
             }
         }
-        if (root_created && opt_.preserve_metadata) sys::apply_metadata(root_dst, ss, &res_.warnings);
+        chain.close();
+        if (root_created) sys::apply_metadata(src, root_dst, ss, meta(), &res_.warnings);
         if (remove_source && !root_blocked && !stop()) {
             std::error_code ec;
-            if (!sys::remove_dir(src, ec, &ss.id)) {
+            if (!src_parent.remove_child(src.filename(), true, &ss.id, ec)) {
                 fail(src, {}, sys::is_exists_error(ec) ? make_error_code(Errc::directory_not_empty_after_move) : ec,
                      "remove source");
             }
         }
     }
+
+    std::map<LinkKey, fs::path> links_; // hard-link set -> its first committed copy
 
     TransferMode mode_;
     const FileOpOptions& opt_;

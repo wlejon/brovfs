@@ -2,6 +2,8 @@
 
 #include "src/win_util.h"
 
+#include <winternl.h>
+
 #include <cstring>
 #include <vector>
 
@@ -29,6 +31,7 @@ bool stat_handle(HANDLE h, sys::Stat& out, std::error_code& ec) {
     out.mtime_ns = filetime_to_unix_ns(basic.LastWriteTime.QuadPart);
     out.atime_ns = filetime_to_unix_ns(basic.LastAccessTime.QuadPart);
     out.btime_ns = filetime_to_unix_ns(basic.CreationTime.QuadPart);
+    out.ctime_ns = filetime_to_unix_ns(basic.ChangeTime.QuadPart);
     out.nlink = standard.NumberOfLinks;
     FILE_ID_INFO idi{};
     if (GetFileInformationByHandleEx(h, FileIdInfo, &idi, sizeof(idi))) {
@@ -139,14 +142,9 @@ bool stat_follow(const fs::path& p, Stat& out, std::error_code& ec) {
     return stat_handle(h.get(), out, ec);
 }
 
-bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) {
-    Handle h = open_nofollow(dir, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE);
-    if (!h.ok()) {
-        ec = last_error();
-        return false;
-    }
-    Stat self;
-    if (!stat_handle(h.get(), self, ec)) return false;
+namespace {
+
+bool check_is_dir(const Stat& self, std::error_code& ec) {
     if (is_link(self.kind)) {
         ec = std::make_error_code(std::errc::too_many_symbolic_link_levels);
         return false;
@@ -155,13 +153,23 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
         ec = std::make_error_code(std::errc::not_a_directory);
         return false;
     }
+    return true;
+}
+
+// Enumerates the directory behind `dirh` from the start (restart classes on the first call,
+// so a handle can be listed more than once).
+bool list_handle(HANDLE dirh, const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) {
+    Stat self;
+    if (!stat_handle(dirh, self, ec) || !check_is_dir(self, ec)) return false;
     const uint64_t volume = self.id.device;
 
     std::vector<uint64_t> buffer(64 * 1024 / sizeof(uint64_t));
     FILE_INFO_BY_HANDLE_CLASS cls = FileIdExtdDirectoryInfo;
     bool first = true;
     for (;;) {
-        if (!GetFileInformationByHandleEx(h.get(), cls, buffer.data(), static_cast<DWORD>(buffer.size() * 8))) {
+        FILE_INFO_BY_HANDLE_CLASS call = cls;
+        if (first) call = cls == FileIdExtdDirectoryInfo ? FileIdExtdDirectoryRestartInfo : FileIdBothDirectoryRestartInfo;
+        if (!GetFileInformationByHandleEx(dirh, call, buffer.data(), static_cast<DWORD>(buffer.size() * 8))) {
             DWORD e = GetLastError();
             if (e == ERROR_NO_MORE_FILES) break;
             if (first && cls == FileIdExtdDirectoryInfo &&
@@ -177,7 +185,7 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
         for (size_t off = 0;;) {
             RawEntry e;
             DWORD next = 0, attrs = 0, tag = 0;
-            int64_t ctime = 0, atime = 0, mtime = 0, size = 0;
+            int64_t ctime = 0, atime = 0, mtime = 0, chtime = 0, size = 0;
             std::wstring_view name;
             if (cls == FileIdExtdDirectoryInfo) {
                 const auto* r = reinterpret_cast<const FILE_ID_EXTD_DIR_INFO*>(base + off);
@@ -187,6 +195,7 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
                 ctime = r->CreationTime.QuadPart;
                 atime = r->LastAccessTime.QuadPart;
                 mtime = r->LastWriteTime.QuadPart;
+                chtime = r->ChangeTime.QuadPart;
                 size = r->EndOfFile.QuadPart;
                 name = std::wstring_view(r->FileName, r->FileNameLength / sizeof(WCHAR));
                 std::memcpy(&e.st.id.lo, r->FileId.Identifier, 8);
@@ -199,6 +208,7 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
                 ctime = r->CreationTime.QuadPart;
                 atime = r->LastAccessTime.QuadPart;
                 mtime = r->LastWriteTime.QuadPart;
+                chtime = r->ChangeTime.QuadPart;
                 size = r->EndOfFile.QuadPart;
                 name = std::wstring_view(r->FileName, r->FileNameLength / sizeof(WCHAR));
                 e.st.id.lo = static_cast<uint64_t>(r->FileId.QuadPart);
@@ -214,6 +224,7 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
                 e.st.btime_ns = filetime_to_unix_ns(ctime);
                 e.st.atime_ns = filetime_to_unix_ns(atime);
                 e.st.mtime_ns = filetime_to_unix_ns(mtime);
+                e.st.ctime_ns = filetime_to_unix_ns(chtime);
                 e.st.id.device = volume;
                 e.st.id.valid = self.id.valid && (e.st.id.lo != 0 || e.st.id.hi != 0);
                 if (!cb(std::move(e))) return true;
@@ -223,6 +234,165 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
         }
     }
     return true;
+}
+
+// ---------------------------------------------------------------- NtCreateFile relative opens
+
+using NtCreateFileFn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER,
+                                        ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(NTSTATUS);
+
+struct NtApi {
+    NtCreateFileFn create = nullptr;
+    RtlNtStatusToDosErrorFn to_dos = nullptr;
+    NtApi() {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (!nt) return;
+        create = reinterpret_cast<NtCreateFileFn>(reinterpret_cast<void*>(GetProcAddress(nt, "NtCreateFile")));
+        to_dos = reinterpret_cast<RtlNtStatusToDosErrorFn>(
+            reinterpret_cast<void*>(GetProcAddress(nt, "RtlNtStatusToDosError")));
+    }
+};
+
+const NtApi& nt() {
+    static const NtApi api;
+    return api;
+}
+
+// Opens `name` (a single component) relative to the directory `parent`, never following a
+// reparse point at `name`.
+Handle open_relative(HANDLE parent, const fs::path& name, ACCESS_MASK access, ULONG options, std::error_code& ec) {
+    const std::wstring& w = name.native();
+    if (w.empty() || w.find_first_of(L"\\/") != std::wstring::npos || w.size() > 32767) {
+        ec = make_error_code(Errc::invalid_argument);
+        return Handle();
+    }
+    if (!nt().create || !nt().to_dos) {
+        ec = std::make_error_code(std::errc::function_not_supported);
+        return Handle();
+    }
+    UNICODE_STRING us;
+    us.Buffer = const_cast<PWSTR>(w.c_str());
+    us.Length = static_cast<USHORT>(w.size() * sizeof(wchar_t));
+    us.MaximumLength = us.Length;
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, parent, nullptr);
+    IO_STATUS_BLOCK io{};
+    HANDLE h = nullptr;
+    NTSTATUS st = nt().create(&h, access | SYNCHRONIZE, &oa, &io, nullptr, 0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+                              options | FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT |
+                                  FILE_SYNCHRONOUS_IO_NONALERT,
+                              nullptr, 0);
+    if (st < 0) {
+        ec = win_error(nt().to_dos(st));
+        return Handle();
+    }
+    return Handle(h);
+}
+
+bool identity_ok(const Stat& st, const FileId* expect, std::error_code& ec) {
+    if (expect && expect->valid && !(st.id == *expect)) {
+        ec = make_error_code(Errc::source_changed);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) {
+    Handle h = open_nofollow(dir, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE);
+    if (!h.ok()) {
+        ec = last_error();
+        return false;
+    }
+    return list_handle(h.get(), cb, ec);
+}
+
+// ---------------------------------------------------------------- Dir
+
+Dir::~Dir() { close(); }
+Dir::Dir(Dir&& o) noexcept : h_(o.h_) { o.h_ = nullptr; }
+Dir& Dir::operator=(Dir&& o) noexcept {
+    if (this != &o) {
+        close();
+        h_ = o.h_;
+        o.h_ = nullptr;
+    }
+    return *this;
+}
+bool Dir::ok() const noexcept { return h_ != nullptr; }
+void Dir::close() noexcept {
+    if (h_) CloseHandle(static_cast<HANDLE>(h_));
+    h_ = nullptr;
+}
+
+bool Dir::open(const fs::path& p, bool follow_leaf, Dir& out, std::error_code& ec) {
+    out.close();
+    std::wstring w = win_extended_path(p.empty() ? fs::path(L".") : p);
+    Handle h(CreateFileW(w.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS | (follow_leaf ? 0 : FILE_FLAG_OPEN_REPARSE_POINT), nullptr));
+    if (!h.ok()) {
+        ec = last_error();
+        return false;
+    }
+    Stat st;
+    if (!stat_handle(h.get(), st, ec) || !check_is_dir(st, ec)) return false;
+    out.h_ = h.release();
+    return true;
+}
+
+bool Dir::open_child(const fs::path& name, const FileId* expect, Dir& out, std::error_code& ec) const {
+    out.close();
+    Handle h = open_relative(static_cast<HANDLE>(h_), name, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, 0, ec);
+    if (!h.ok()) return false;
+    Stat st;
+    if (!stat_handle(h.get(), st, ec)) return false;
+    // The planned directory is no longer there (a link or another object took its name).
+    if (!identity_ok(st, expect, ec)) return false;
+    if (!check_is_dir(st, ec)) {
+        if (expect && expect->valid) ec = make_error_code(Errc::source_changed);
+        return false;
+    }
+    out.h_ = h.release();
+    return true;
+}
+
+bool Dir::stat(Stat& out, std::error_code& ec) const {
+    out = Stat{};
+    return stat_handle(static_cast<HANDLE>(h_), out, ec);
+}
+
+bool Dir::stat_child(const fs::path& name, Stat& out, std::error_code& ec) const {
+    out = Stat{};
+    Handle h = open_relative(static_cast<HANDLE>(h_), name, FILE_READ_ATTRIBUTES, 0, ec);
+    return h.ok() && stat_handle(h.get(), out, ec);
+}
+
+bool Dir::list(const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) const {
+    return list_handle(static_cast<HANDLE>(h_), cb, ec);
+}
+
+bool Dir::remove_child(const fs::path& name, bool is_dir, const FileId* expect, std::error_code& ec) const {
+    Handle h = open_relative(static_cast<HANDLE>(h_), name, DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, 0,
+                             ec);
+    if (!h.ok()) return false;
+    Stat st;
+    if (!stat_handle(h.get(), st, ec) || !identity_ok(st, expect, ec)) return false;
+    if ((st.kind == FileKind::Directory) != is_dir) {
+        ec = make_error_code(Errc::source_changed);
+        return false;
+    }
+    return delete_by_handle(h.get(), ec);
+}
+
+bool make_hard_link(const fs::path& target, const fs::path& link, std::error_code& ec) {
+    std::wstring t = win_extended_path(target), l = win_extended_path(link);
+    if (CreateHardLinkW(l.c_str(), t.c_str(), nullptr)) return true;
+    ec = last_error();
+    return false;
 }
 
 std::error_code cross_device_error() { return win_error(ERROR_NOT_SAME_DEVICE); }

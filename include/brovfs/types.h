@@ -119,6 +119,7 @@ struct OpResult {
     uint64_t skipped = 0;      // skipped by a conflict decision
     uint64_t reflinked = 0;    // files cloned copy-on-write (FICLONE)
     uint64_t kernel_copied = 0; // files copied in-kernel / by the OS copy engine (copy_file_range, CopyFile2)
+    uint64_t hard_linked = 0;  // files recreated as a hard link to an earlier file of the same set
 
     [[nodiscard]] bool ok() const noexcept { return outcome == Outcome::Success; }
 };

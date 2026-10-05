@@ -16,6 +16,7 @@ set(BROVFS_SOURCES
     src/path.cpp
     src/remove.cpp
     src/scanner.cpp
+    src/staging.cpp
     src/sys_common.cpp
     src/transfer.cpp
     src/trash_common.cpp
@@ -23,6 +24,7 @@ set(BROVFS_SOURCES
     src/version.cpp
     src/volumes.cpp
     src/walk.cpp
+    src/watch_core.cpp
     src/worker.cpp
 )
 
@@ -30,15 +32,25 @@ if(WIN32)
     list(APPEND BROVFS_SOURCES
         src/sys_win.cpp
         src/sys_win_copy.cpp
+        src/sys_win_meta.cpp
         src/trash_recycle_bin.cpp
         src/volumes_win.cpp
+        src/watcher_win.cpp
     )
 else()
     list(APPEND BROVFS_SOURCES
         src/sys_posix.cpp
+        src/sys_posix_copy.cpp
         src/trash_freedesktop.cpp
         src/volumes_posix.cpp
     )
+    if(APPLE)
+        enable_language(OBJCXX)
+        list(APPEND BROVFS_SOURCES src/watcher_fsevents.cpp src/trash_macos.cpp src/trash_macos_ns.mm)
+        set_source_files_properties(src/trash_macos_ns.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    else()
+        list(APPEND BROVFS_SOURCES src/watcher_inotify.cpp)
+    endif()
 endif()
 
 add_library(brovfs STATIC ${BROVFS_SOURCES})
@@ -66,6 +78,9 @@ if(WIN32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(brovfs PUBLIC Threads::Threads)
+    if(APPLE)
+        target_link_libraries(brovfs PUBLIC "-framework CoreServices" "-framework Foundation")
+    endif()
 endif()
 
 option(BROVFS_BUILD_TESTS "Build the brovfs test suite" ON)

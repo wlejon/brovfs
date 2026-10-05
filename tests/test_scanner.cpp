@@ -70,7 +70,11 @@ static void test_unicode(const Scratch& s) {
 #ifndef _WIN32
     std::string bad = std::string("bad\xff\xfe") + "name.txt";
     write_file(root / bad, "raw");
-    CHECK(names_of(vfs::scan_directory(root, vfs::ScanOptions())).count(bad) == 1);
+    if (path_exists(root / bad)) {
+        CHECK(names_of(vfs::scan_directory(root, vfs::ScanOptions())).count(bad) == 1);
+    } else {
+        note("file system rejects non-UTF-8 names (APFS); raw-name case skipped");
+    }
 #endif
 }
 

@@ -2,8 +2,10 @@
 
 #include "brovfs/types.h"
 
+#include <chrono>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace bro::vfs {
@@ -49,9 +51,28 @@ enum class ConflictPolicy : uint8_t {
 struct FileOpOptions {
     ConflictPolicy conflict = ConflictPolicy::Ask;
     ConflictResolver on_conflict;
-    bool preserve_metadata = true;  // mode / timestamps / xattrs (POSIX), attributes / times / streams (Windows)
+    // Timestamps (access, modification; birth time where the OS lets it be set: Windows,
+    // macOS — Linux has no API for it), POSIX mode, Windows attributes. When false, nothing
+    // below applies either and copies get fresh times and umask permissions.
+    bool preserve_metadata = true;
+    // Extended attributes of files and directories: Linux user.* (trusted.* / security.* are
+    // the source's policy and never copied), macOS all (via copyfile, so resource forks and
+    // compressed files are handled). Windows: alternate data streams of directories; a file's
+    // streams and EAs always travel with it (CopyFile2).
+    bool preserve_xattrs = true;
+    // Access policy travels only when asked: POSIX ACLs (system.posix_acl_access / _default),
+    // macOS extended ACLs, the Windows DACL (protected DACLs as-is; otherwise the explicit
+    // ACEs, and inheritance from the destination's parent).
+    bool preserve_acls = false;
+    // Ownership where the process may set it: as root, uid and gid; otherwise the group if the
+    // caller belongs to it. Windows (with preserve_acls): owner and group if permitted.
+    // Anything not permitted is skipped silently.
+    bool preserve_owner = true;
+    // Files that are hard links of each other within one operation's sources are linked to
+    // each other in the copy too, instead of becoming independent copies.
+    bool preserve_hard_links = true;
     bool sync = false;              // flush every file before commit (always done before a move deletes its source)
-    bool allow_reflink = true;      // try FICLONE first on Linux
+    bool allow_reflink = true;      // try a CoW clone first: FICLONE on Linux, clonefile on macOS
     bool allow_kernel_copy = true;  // copy_file_range on Linux; CopyFile2 on Windows is always used
     size_t buffer_size = 1u << 20;
 };
@@ -98,11 +119,40 @@ OpResult remove(const std::vector<fs::path>& paths, ProgressCallback on_progress
 // A free "name (N).ext" next to `path` (returns `path` itself if it does not exist).
 [[nodiscard]] fs::path unique_sibling_name(const fs::path& path);
 
+// ---------------------------------------------------------------- crash leftovers
+//
+// Every write is staged as ".brovfs-<16 hex digits>.tmp" in the destination directory and
+// renamed into place. A crash or power loss between the two leaves the staging file behind
+// (never a half-written destination). These recognise and remove such leftovers.
+
+// True for a name brovfs stages under (exactly ".brovfs-" + 16 lowercase hex + ".tmp").
+[[nodiscard]] bool is_staging_name(std::string_view leaf) noexcept;
+
+struct StagingLeftover {
+    fs::path path;
+    FileKind kind = FileKind::Unknown; // a regular file; a link / FIFO staged by a copy; see below
+    uint64_t size = 0;
+    int64_t changed_ms = 0;            // last status change (ctime / NTFS ChangeTime), Unix ms
+    FileId id;
+};
+
+// Leftovers in `dir` (and below it when `recursive`; links are never followed). A directory is
+// a leftover only when empty (a junction interrupted between its mkdir and its reparse data);
+// brovfs never stages directory contents. Anything whose status changed less than
+// `min_age` ago may belong to an operation still running (a copy in progress keeps touching
+// it) and is not listed.
+[[nodiscard]] std::vector<StagingLeftover> find_staging_leftovers(
+    const fs::path& dir, bool recursive, std::chrono::seconds min_age, std::vector<ItemError>* errors = nullptr);
+
+// Deletes every leftover find_staging_leftovers lists, each re-checked by identity first.
+OpResult clean_staging_leftovers(const fs::path& dir, bool recursive = false,
+                                 std::chrono::seconds min_age = std::chrono::seconds(600));
+
 // ---------------------------------------------------------------- single-file clone
 
 enum class CopyMethod : uint8_t {
     None = 0,
-    Reflink,     // copy-on-write clone (FICLONE): no data was copied
+    Reflink,     // copy-on-write clone (FICLONE / clonefile): no data was copied
     KernelCopy,  // copy_file_range (Linux) or CopyFile2 (Windows; may block-clone on ReFS, not observable)
     Stream,      // read/write loop
 };
@@ -119,8 +169,9 @@ struct CloneResult {
 // std::errc::operation_not_supported and leaves no destination.
 CloneResult clone_file(const fs::path& src, const fs::path& dst, bool allow_fallback = true);
 
-// Whether `path`'s file system can CoW-clone (Linux: probes FICLONE in a temp file next to
-// `path`, which must be a writable directory; Windows: FILE_SUPPORTS_BLOCK_REFCOUNTING).
+// Whether `path`'s file system can CoW-clone (Linux / macOS: probes FICLONE / fclonefileat in a
+// temp file next to `path`, which must be a writable directory; Windows:
+// FILE_SUPPORTS_BLOCK_REFCOUNTING).
 [[nodiscard]] bool reflink_supported(const fs::path& directory);
 
 } // namespace bro::vfs

@@ -33,6 +33,11 @@ public:
     Handle& operator=(const Handle&) = delete;
     HANDLE get() const { return h_; }
     bool ok() const { return h_ != INVALID_HANDLE_VALUE && h_ != nullptr; }
+    HANDLE release() {
+        HANDLE h = h_;
+        h_ = INVALID_HANDLE_VALUE;
+        return h;
+    }
     void reset() {
         if (ok()) CloseHandle(h_);
         h_ = INVALID_HANDLE_VALUE;
@@ -82,6 +87,11 @@ inline FileKind kind_from(DWORD attrs, DWORD tag, bool& link_is_dir) {
 }
 
 bool stat_handle(HANDLE h, sys::Stat& out, std::error_code& ec);
+
+// sys_win_meta.cpp
+void copy_security(const fs::path& src, const fs::path& dst, bool owner, std::vector<ItemError>* warnings);
+void copy_streams(const fs::path& src, const fs::path& dst, std::vector<ItemError>* warnings);
+bool set_birth_time(const fs::path& dst, int64_t btime_ns, std::error_code& ec);
 
 // REPARSE_DATA_BUFFER lives in the DDK (ntifs.h); this is its documented layout.
 struct ReparseData {

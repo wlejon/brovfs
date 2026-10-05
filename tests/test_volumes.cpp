@@ -30,6 +30,15 @@ int main() {
         // The chosen mount must contain the path (not a same-device bind mount elsewhere).
         std::error_code ec;
         auto rel = fs::canonical(s.root(), ec).lexically_relative(here->mount_point);
+#ifdef __APPLE__
+        // /Users is firmlinked from the Data volume: the path is reached through "/", and the
+        // same object lives under the Data volume's own mount point.
+        if (!rel.empty() && *rel.begin() == "..") {
+            fs::path via = here->mount_point / fs::canonical(s.root(), ec).relative_path();
+            CHECK_MSG(vfs::same_file(via, s.root(), ec), u8(via));
+            rel = fs::path("firmlinked");
+        }
+#endif
         CHECK_MSG(!rel.empty() && *rel.begin() != "..", u8(rel));
         CHECK(!here->is_read_only);
     }

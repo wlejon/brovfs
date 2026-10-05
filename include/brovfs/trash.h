@@ -41,7 +41,7 @@ public:
     virtual OpResult empty() = 0;
 };
 
-// The platform trash: Windows Recycle Bin, or the freedesktop.org trash elsewhere.
+// The platform trash: Windows Recycle Bin, the macOS Trash, or the freedesktop.org trash.
 [[nodiscard]] std::shared_ptr<Trash> system_trash();
 
 // Trash several paths; result.trash_ids is parallel to `paths`.
@@ -64,6 +64,24 @@ struct FreedesktopTrashConfig {
 };
 
 std::shared_ptr<Trash> make_freedesktop_trash(FreedesktopTrashConfig config = FreedesktopTrashConfig());
+#endif
+
+#ifdef __APPLE__
+// The macOS Trash through NSFileManager (-trashItemAtURL:), which picks the right trash for
+// the item's volume (~/.Trash, /Volumes/X/.Trashes/<uid>) and resolves name collisions.
+// Finder's own "Put Back" records live in Finder-private .DS_Store data that only Finder may
+// write, so items trashed here cannot be put back from Finder; brovfs records the original
+// path and deletion time in xattrs on the item itself (com.bro.vfs.putback /
+// com.bro.vfs.trashed, set before the move and removed on restore) and restores from those.
+// Enumerating a trash folder needs Full Disk Access on recent macOS; without it list()
+// reports the denial in `errors` and still lists every item brovfs trashed, from a journal of
+// stored paths (one per line).
+struct MacTrashConfig {
+    fs::path journal; // empty = ~/Library/Application Support/brovfs/trash-journal
+    bool search_volumes = true; // also list /Volumes/*/.Trashes/<uid>
+};
+
+std::shared_ptr<Trash> make_macos_trash(MacTrashConfig config = MacTrashConfig());
 #endif
 
 #ifdef _WIN32

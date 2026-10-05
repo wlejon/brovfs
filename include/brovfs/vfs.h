@@ -9,4 +9,5 @@
 #include "brovfs/types.h"
 #include "brovfs/version.h"
 #include "brovfs/volumes.h"
+#include "brovfs/watcher.h"
 #include "brovfs/worker.h"

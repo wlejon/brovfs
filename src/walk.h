@@ -3,6 +3,8 @@
 #include "src/sys.h"
 
 #include <functional>
+#include <utility>
+#include <vector>
 
 namespace bro::vfs::detail {
 
@@ -25,12 +27,46 @@ struct WalkOptions {
     bool follow_root_link = false;
 };
 
-// Pre-order, depth-first, never following links. A directory that cannot be listed is
-// reported to on_error and skipped; its siblings continue. Returns false if on_node asked to
-// stop or the token was cancelled.
+// Pre-order, depth-first, never following links. Each directory is opened relative to its
+// parent's open handle and checked against the identity it was listed with, so a directory
+// swapped for a link (or another tree) mid-walk is refused, not entered. A directory that
+// cannot be opened or listed is reported to on_error (right after its own on_node) and
+// skipped; its siblings continue. Returns false if on_node asked to stop or the token was
+// cancelled.
 bool walk(const fs::path& root, const WalkOptions& options, const CancellationToken* token,
           const std::function<bool(const WalkNode&)>& on_node,
           const std::function<void(const fs::path&, const std::error_code&)>& on_error);
+
+// Open directory handles along the current path of a planned tree (nodes in pre-order, each
+// with its parent's index, -1 for the root). Each is opened relative to its parent's handle and
+// checked against the planned identity, so acting on a child through get(parent) can never be
+// redirected by an ancestor swapped after planning. Visiting nodes in pre-order or reverse
+// pre-order keeps at most one handle per level open.
+class DirChain {
+public:
+    using ParentOf = std::function<int64_t(int64_t)>;
+    using NameOf = std::function<fs::path(int64_t)>;
+    using IdOf = std::function<FileId(int64_t)>;
+
+    DirChain(sys::Dir root, ParentOf parent, NameOf name, IdOf id)
+        : root_(std::move(root)), parent_(std::move(parent)), name_(std::move(name)), id_(std::move(id)) {}
+
+    // The open directory for node `index` (-1: the root); null with `ec` set on failure, and
+    // `failed` (if given) set to the node whose directory could not be opened.
+    const sys::Dir* get(int64_t index, std::error_code& ec, int64_t* failed = nullptr);
+    // Closes every handle (the root's too); get() fails afterwards.
+    void close() {
+        stack_.clear();
+        root_.close();
+    }
+
+private:
+    sys::Dir root_;
+    ParentOf parent_;
+    NameOf name_;
+    IdOf id_;
+    std::vector<std::pair<int64_t, sys::Dir>> stack_;
+};
 
 bool is_hidden(const std::string& name, const sys::Stat& st);
 FileEntry make_entry(const fs::path& path, std::string name, const sys::Stat& st, uint32_t depth);

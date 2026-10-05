@@ -39,6 +39,8 @@ std::shared_ptr<Trash> system_trash() {
     if (!instance) {
 #ifdef _WIN32
         instance = make_recycle_bin();
+#elif defined(__APPLE__)
+        instance = make_macos_trash();
 #else
         instance = make_freedesktop_trash();
 #endif

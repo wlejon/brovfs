@@ -1,30 +1,26 @@
+// POSIX platform layer: stat, listing, renames, directories, removal, links, and the
+// directory-fd `Dir` used for race-free traversal and removal. Data copy and metadata live in
+// sys_posix_copy.cpp.
 #ifndef _WIN32
 
-#include "src/sys.h"
+#include "src/posix_util.h"
 
-#include <cerrno>
+#include "brovfs/path.h"
+
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
-#include <fcntl.h>
 #include <fstream>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 #ifdef __linux__
-#include <linux/fs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
-#include <sys/xattr.h>
 #endif
 
-namespace bro::vfs::sys {
+namespace bro::vfs {
 
-namespace {
-
-std::error_code errno_ec(int e) { return {e, std::system_category()}; }
+namespace posix {
 
 FileKind kind_from_mode(mode_t m) {
     if (S_ISREG(m)) return FileKind::Regular;
@@ -36,6 +32,8 @@ FileKind kind_from_mode(mode_t m) {
     if (S_ISBLK(m)) return FileKind::BlockDevice;
     return FileKind::Unknown;
 }
+
+namespace {
 
 FileKind kind_from_dtype(unsigned char t) {
     switch (t) {
@@ -50,16 +48,20 @@ FileKind kind_from_dtype(unsigned char t) {
     }
 }
 
-void fill_from_stat(const struct stat& s, Stat& st) {
+int64_t ns(int64_t sec, int64_t nsec) { return sec * 1000000000 + nsec; }
+
+void fill_from_stat(const struct stat& s, sys::Stat& st) {
     st.kind = kind_from_mode(s.st_mode);
     st.size = st.kind == FileKind::Regular || st.kind == FileKind::Symlink ? static_cast<uint64_t>(s.st_size) : 0;
 #if defined(__APPLE__)
-    st.mtime_ns = static_cast<int64_t>(s.st_mtimespec.tv_sec) * 1000000000 + s.st_mtimespec.tv_nsec;
-    st.atime_ns = static_cast<int64_t>(s.st_atimespec.tv_sec) * 1000000000 + s.st_atimespec.tv_nsec;
-    st.btime_ns = static_cast<int64_t>(s.st_birthtimespec.tv_sec) * 1000000000 + s.st_birthtimespec.tv_nsec;
+    st.mtime_ns = ns(s.st_mtimespec.tv_sec, s.st_mtimespec.tv_nsec);
+    st.atime_ns = ns(s.st_atimespec.tv_sec, s.st_atimespec.tv_nsec);
+    st.ctime_ns = ns(s.st_ctimespec.tv_sec, s.st_ctimespec.tv_nsec);
+    st.btime_ns = ns(s.st_birthtimespec.tv_sec, s.st_birthtimespec.tv_nsec);
 #else
-    st.mtime_ns = static_cast<int64_t>(s.st_mtim.tv_sec) * 1000000000 + s.st_mtim.tv_nsec;
-    st.atime_ns = static_cast<int64_t>(s.st_atim.tv_sec) * 1000000000 + s.st_atim.tv_nsec;
+    st.mtime_ns = ns(s.st_mtim.tv_sec, s.st_mtim.tv_nsec);
+    st.atime_ns = ns(s.st_atim.tv_sec, s.st_atim.tv_nsec);
+    st.ctime_ns = ns(s.st_ctim.tv_sec, s.st_ctim.tv_nsec);
     st.btime_ns = 0;
 #endif
     st.mode = static_cast<uint32_t>(s.st_mode);
@@ -75,14 +77,13 @@ void fill_from_stat(const struct stat& s, Stat& st) {
 #if defined(__linux__) && defined(STATX_BASIC_STATS)
 std::atomic<bool> g_statx_available{true};
 
-void fill_from_statx(const struct statx& s, Stat& st) {
+void fill_from_statx(const struct statx& s, sys::Stat& st) {
     st.kind = kind_from_mode(s.stx_mode);
     st.size = st.kind == FileKind::Regular || st.kind == FileKind::Symlink ? s.stx_size : 0;
-    st.mtime_ns = static_cast<int64_t>(s.stx_mtime.tv_sec) * 1000000000 + s.stx_mtime.tv_nsec;
-    st.atime_ns = static_cast<int64_t>(s.stx_atime.tv_sec) * 1000000000 + s.stx_atime.tv_nsec;
-    st.btime_ns = (s.stx_mask & STATX_BTIME)
-                      ? static_cast<int64_t>(s.stx_btime.tv_sec) * 1000000000 + s.stx_btime.tv_nsec
-                      : 0;
+    st.mtime_ns = ns(s.stx_mtime.tv_sec, s.stx_mtime.tv_nsec);
+    st.atime_ns = ns(s.stx_atime.tv_sec, s.stx_atime.tv_nsec);
+    st.ctime_ns = ns(s.stx_ctime.tv_sec, s.stx_ctime.tv_nsec);
+    st.btime_ns = (s.stx_mask & STATX_BTIME) ? ns(s.stx_btime.tv_sec, s.stx_btime.tv_nsec) : 0;
     st.mode = s.stx_mode;
     st.uid = s.stx_uid;
     st.gid = s.stx_gid;
@@ -94,7 +95,19 @@ void fill_from_statx(const struct statx& s, Stat& st) {
 }
 #endif
 
-bool stat_at(int dirfd, const char* name, bool follow, Stat& out, int& err) {
+#if defined(__APPLE__)
+// Read once before main(), while the process is single-threaded: umask() can only be read by
+// setting it.
+const mode_t g_umask = [] {
+    mode_t m = ::umask(022);
+    ::umask(m);
+    return m;
+}();
+#endif
+
+} // namespace
+
+bool stat_at(int dirfd, const char* name, bool follow, sys::Stat& out, int& err) {
 #if defined(__linux__) && defined(STATX_BASIC_STATS)
     if (g_statx_available.load(std::memory_order_relaxed)) {
         struct statx sx;
@@ -119,29 +132,6 @@ bool stat_at(int dirfd, const char* name, bool follow, Stat& out, int& err) {
     return false;
 }
 
-class Fd {
-public:
-    explicit Fd(int fd = -1) : fd_(fd) {}
-    ~Fd() { reset(); }
-    Fd(const Fd&) = delete;
-    Fd& operator=(const Fd&) = delete;
-    int get() const { return fd_; }
-    bool ok() const { return fd_ >= 0; }
-    void reset() {
-        if (fd_ >= 0) ::close(fd_);
-        fd_ = -1;
-    }
-    int release_close() { // close and return errno-style result (0 ok)
-        int r = 0;
-        if (fd_ >= 0 && ::close(fd_) != 0) r = errno;
-        fd_ = -1;
-        return r;
-    }
-
-private:
-    int fd_;
-};
-
 bool write_all(int fd, const char* p, size_t n, int& err) {
     while (n > 0) {
         ssize_t w = ::write(fd, p, n);
@@ -157,6 +147,9 @@ bool write_all(int fd, const char* p, size_t n, int& err) {
 }
 
 mode_t current_umask() {
+#if defined(__APPLE__)
+    return g_umask;
+#else
     static const mode_t mask = [] {
         std::ifstream in("/proc/self/status");
         std::string line;
@@ -166,77 +159,19 @@ mode_t current_umask() {
         return static_cast<mode_t>(022);
     }();
     return mask;
-}
-
-#ifdef __linux__
-void copy_xattrs(int in, int out, const fs::path& dst, std::vector<ItemError>* warnings) {
-    ssize_t len = ::flistxattr(in, nullptr, 0);
-    if (len <= 0) return;
-    std::string names(static_cast<size_t>(len), '\0');
-    len = ::flistxattr(in, names.data(), names.size());
-    if (len <= 0) return;
-    std::string value;
-    for (size_t pos = 0; pos < static_cast<size_t>(len);) {
-        const char* name = names.c_str() + pos;
-        pos += std::strlen(name) + 1;
-        // Only the user namespace is portable between file systems and users; security.* and
-        // system.* (ACLs) are tied to the source's policy.
-        if (std::strncmp(name, "user.", 5) != 0) continue;
-        ssize_t vlen = ::fgetxattr(in, name, nullptr, 0);
-        if (vlen < 0) continue;
-        value.resize(static_cast<size_t>(vlen));
-        vlen = ::fgetxattr(in, name, value.data(), value.size());
-        if (vlen < 0) continue;
-        if (::fsetxattr(out, name, value.data(), static_cast<size_t>(vlen), 0) != 0 && warnings &&
-            errno != ENOTSUP && errno != EOPNOTSUPP) {
-            warnings->push_back({{}, dst, errno_ec(errno), std::string("setxattr ") + name});
-        }
-    }
-}
 #endif
-
-void set_file_metadata(int fd, const fs::path& dst, const Stat& st, bool preserve, std::vector<ItemError>* warnings) {
-    mode_t mode = preserve ? static_cast<mode_t>(st.mode & 07777)
-                           : static_cast<mode_t>(st.mode & 0777 & ~current_umask());
-    if (preserve && ::geteuid() == 0) {
-        if (::fchown(fd, st.uid, st.gid) != 0 && warnings) warnings->push_back({{}, dst, errno_ec(errno), "chown"});
-    }
-    if (::fchmod(fd, mode) != 0 && warnings) warnings->push_back({{}, dst, errno_ec(errno), "chmod"});
-    if (preserve) {
-        struct timespec ts[2];
-        ts[0].tv_sec = st.atime_ns / 1000000000;
-        ts[0].tv_nsec = st.atime_ns % 1000000000;
-        ts[1].tv_sec = st.mtime_ns / 1000000000;
-        ts[1].tv_nsec = st.mtime_ns % 1000000000;
-        if (::futimens(fd, ts) != 0 && warnings) warnings->push_back({{}, dst, errno_ec(errno), "set times"});
-    }
 }
 
-} // namespace
-
-bool lstat(const fs::path& p, Stat& out, std::error_code& ec) {
-    int err = 0;
-    if (stat_at(AT_FDCWD, p.c_str(), false, out, err)) return true;
-    ec = errno_ec(err);
-    return false;
-}
-
-bool stat_follow(const fs::path& p, Stat& out, std::error_code& ec) {
-    int err = 0;
-    if (stat_at(AT_FDCWD, p.c_str(), true, out, err)) return true;
-    ec = errno_ec(err);
-    return false;
-}
-
-bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) {
-    Fd fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+bool list_fd(int dirfd, const std::function<bool(sys::RawEntry&&)>& cb, std::error_code& ec) {
+    // A fresh open file description: listing never disturbs (or depends on) dirfd's offset.
+    Fd fd(::openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (!fd.ok()) {
         ec = errno_ec(errno);
         return false;
     }
     auto deliver = [&](const char* name, unsigned char dtype) -> bool {
         if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0))) return true;
-        RawEntry e;
+        sys::RawEntry e;
         e.name = fs::path(name);
         e.name_utf8 = name;
         int err = 0;
@@ -264,7 +199,7 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
             return false;
         }
         if (n == 0) break;
-        // Copy out the batch: the callback may recurse (scanner) and reuse the thread buffer.
+        // Copy out the batch: the callback may recurse and reuse the thread buffer.
         std::vector<std::pair<std::string, unsigned char>> names;
         for (long off = 0; off < n;) {
             auto* d = reinterpret_cast<linux_dirent64*>(buf + off);
@@ -277,13 +212,14 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
     }
     return true;
 #else
-    int dup_fd = ::dup(fd.get());
-    DIR* d = ::fdopendir(dup_fd);
+    int read_fd = ::dup(fd.get());
+    DIR* d = read_fd >= 0 ? ::fdopendir(read_fd) : nullptr;
     if (!d) {
         ec = errno_ec(errno);
-        ::close(dup_fd);
+        if (read_fd >= 0) ::close(read_fd);
         return false;
     }
+    std::vector<std::pair<std::string, unsigned char>> names;
     for (;;) {
         errno = 0;
         struct dirent* de = ::readdir(d);
@@ -295,12 +231,142 @@ bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, st
             }
             break;
         }
-        if (!deliver(de->d_name, de->d_type)) break;
+        names.emplace_back(de->d_name, de->d_type);
     }
     ::closedir(d);
+    for (auto& [name, type] : names) {
+        if (!deliver(name.c_str(), type)) break;
+    }
     return true;
 #endif
 }
+
+} // namespace posix
+
+namespace sys {
+
+using namespace posix;
+
+bool lstat(const fs::path& p, Stat& out, std::error_code& ec) {
+    int err = 0;
+    if (stat_at(AT_FDCWD, p.c_str(), false, out, err)) return true;
+    ec = errno_ec(err);
+    return false;
+}
+
+bool stat_follow(const fs::path& p, Stat& out, std::error_code& ec) {
+    int err = 0;
+    if (stat_at(AT_FDCWD, p.c_str(), true, out, err)) return true;
+    ec = errno_ec(err);
+    return false;
+}
+
+bool list_dir(const fs::path& dir, const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) {
+    Fd fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!fd.ok()) {
+        ec = errno_ec(errno);
+        return false;
+    }
+    return list_fd(fd.get(), cb, ec);
+}
+
+// ---------------------------------------------------------------- Dir
+
+Dir::~Dir() { close(); }
+Dir::Dir(Dir&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+Dir& Dir::operator=(Dir&& o) noexcept {
+    if (this != &o) {
+        close();
+        fd_ = o.fd_;
+        o.fd_ = -1;
+    }
+    return *this;
+}
+bool Dir::ok() const noexcept { return fd_ >= 0; }
+void Dir::close() noexcept {
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+}
+
+bool Dir::open(const fs::path& p, bool follow_leaf, Dir& out, std::error_code& ec) {
+    out.close();
+    const char* path = p.empty() ? "." : p.c_str();
+    int fd = ::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | (follow_leaf ? 0 : O_NOFOLLOW));
+    if (fd < 0) {
+        ec = errno_ec(errno);
+        return false;
+    }
+    out.fd_ = fd;
+    return true;
+}
+
+namespace {
+bool matches(int fd, const FileId* expect, std::error_code& ec) {
+    if (!expect || !expect->valid) return true;
+    struct stat s;
+    if (::fstat(fd, &s) != 0) {
+        ec = errno_ec(errno);
+        return false;
+    }
+    if (static_cast<uint64_t>(s.st_ino) != expect->lo || static_cast<uint64_t>(s.st_dev) != expect->device) {
+        ec = make_error_code(Errc::source_changed);
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+bool Dir::open_child(const fs::path& name, const FileId* expect, Dir& out, std::error_code& ec) const {
+    out.close();
+    Fd fd(::openat(fd_, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!fd.ok()) {
+        int e = errno;
+        // The planned directory is no longer there: a link or a non-directory took its name.
+        ec = (expect && expect->valid && (e == ELOOP || e == ENOTDIR)) ? make_error_code(Errc::source_changed)
+                                                                       : errno_ec(e);
+        return false;
+    }
+    if (!matches(fd.get(), expect, ec)) return false;
+    out.fd_ = fd.release();
+    return true;
+}
+
+bool Dir::stat(Stat& out, std::error_code& ec) const {
+    struct stat s;
+    if (::fstat(fd_, &s) != 0) {
+        ec = errno_ec(errno);
+        return false;
+    }
+    fill_from_stat(s, out);
+    return true;
+}
+
+bool Dir::stat_child(const fs::path& name, Stat& out, std::error_code& ec) const {
+    int err = 0;
+    if (stat_at(fd_, name.c_str(), false, out, err)) return true;
+    ec = errno_ec(err);
+    return false;
+}
+
+bool Dir::list(const std::function<bool(RawEntry&&)>& cb, std::error_code& ec) const { return list_fd(fd_, cb, ec); }
+
+bool Dir::remove_child(const fs::path& name, bool is_dir, const FileId* expect, std::error_code& ec) const {
+    if (expect && expect->valid) {
+        Stat st;
+        if (!stat_child(name, st, ec)) return false;
+        if (!(st.id == *expect) || (st.kind == FileKind::Directory) != is_dir) {
+            ec = make_error_code(Errc::source_changed);
+            return false;
+        }
+    }
+    if (::unlinkat(fd_, name.c_str(), is_dir ? AT_REMOVEDIR : 0) != 0) {
+        ec = errno_ec(errno);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- renames
 
 bool read_link_target(const fs::path& link, std::string& target, std::error_code& ec) {
     std::string buf(256, '\0');
@@ -322,15 +388,22 @@ bool read_link_target(const fs::path& link, std::string& target, std::error_code
 std::error_code cross_device_error() { return errno_ec(EXDEV); }
 
 bool rename_noreplace(const fs::path& from, const fs::path& to, std::error_code& ec) {
-#ifdef __linux__
+#if defined(__linux__)
     if (::renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0) return true;
     int e = errno;
     if (e != EINVAL && e != ENOSYS && e != ENOTSUP && e != EOPNOTSUPP) {
         ec = errno_ec(e);
         return false;
     }
+#elif defined(__APPLE__)
+    if (::renamex_np(from.c_str(), to.c_str(), RENAME_EXCL) == 0) return true;
+    int e = errno;
+    if (e != ENOTSUP && e != EINVAL) {
+        ec = errno_ec(e);
+        return false;
+    }
 #endif
-    // No RENAME_NOREPLACE on this file system. For non-directories link()+unlink() is atomic
+    // No exclusive rename on this file system. For non-directories link()+unlink() is atomic
     // with respect to an existing destination; directories fall back to check-then-rename.
     struct stat s;
     if (::lstat(from.c_str(), &s) != 0) {
@@ -381,6 +454,8 @@ bool is_not_found(const std::error_code& ec) {
     return (ec.category() == std::system_category() && ec.value() == ENOENT) || ec == Errc::not_found;
 }
 
+// ---------------------------------------------------------------- create / remove
+
 bool make_dir(const fs::path& p, std::error_code& ec) {
     if (::mkdir(p.c_str(), 0700) != 0) {
         ec = errno_ec(errno);
@@ -398,30 +473,31 @@ bool make_dir_default(const fs::path& p, std::error_code& ec) {
 }
 
 namespace {
-bool identity_matches(const fs::path& p, const FileId* expect, std::error_code& ec) {
-    if (!expect || !expect->valid) return true;
-    Stat st;
-    if (!lstat(p, st, ec)) return false;
-    if (!(st.id == *expect)) {
-        ec = make_error_code(Errc::source_changed);
+// Removal by path goes through the parent directory's fd, so the identity check and the
+// unlink name the same directory entry.
+bool remove_via_parent(const fs::path& p_in, bool is_dir, const FileId* expect, std::error_code& ec) {
+    fs::path p = strip_trailing_separators(p_in);
+    fs::path leaf = leaf_name(p);
+    if (leaf.empty() || leaf == "." || leaf == "..") {
+        ec = make_error_code(Errc::invalid_argument);
         return false;
     }
-    return true;
+    Dir parent;
+    if (!Dir::open(p.parent_path(), true, parent, ec)) return false;
+    return parent.remove_child(leaf, is_dir, expect, ec);
 }
 } // namespace
 
 bool remove_dir(const fs::path& p, std::error_code& ec, const FileId* expect) {
-    if (!identity_matches(p, expect, ec)) return false;
-    if (::rmdir(p.c_str()) != 0) {
-        ec = errno_ec(errno);
-        return false;
-    }
-    return true;
+    return remove_via_parent(p, true, expect, ec);
 }
 
 bool remove_nondir(const fs::path& p, std::error_code& ec, const FileId* expect) {
-    if (!identity_matches(p, expect, ec)) return false;
-    if (::unlink(p.c_str()) != 0) {
+    return remove_via_parent(p, false, expect, ec);
+}
+
+bool make_hard_link(const fs::path& target, const fs::path& link, std::error_code& ec) {
+    if (::linkat(AT_FDCWD, target.c_str(), AT_FDCWD, link.c_str(), 0) != 0) {
         ec = errno_ec(errno);
         return false;
     }
@@ -450,166 +526,12 @@ bool copy_special(const Stat& st, const fs::path& dst, std::error_code& ec) {
     return true;
 }
 
-CopyMethod copy_file_data(const fs::path& src, const Stat& src_st, const fs::path& dst, const DataCopyHooks& hooks,
-                          uint64_t& bytes, std::error_code& ec) {
-    bytes = 0;
-    Fd in(::open(src.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
-    if (!in.ok()) {
-        ec = errno_ec(errno);
-        return CopyMethod::None;
-    }
-    struct stat ins;
-    if (::fstat(in.get(), &ins) != 0) {
-        ec = errno_ec(errno);
-        return CopyMethod::None;
-    }
-    if (!S_ISREG(ins.st_mode) || (src_st.id.valid && (static_cast<uint64_t>(ins.st_ino) != src_st.id.lo ||
-                                                      static_cast<uint64_t>(ins.st_dev) != src_st.id.device))) {
-        ec = make_error_code(Errc::source_changed);
-        return CopyMethod::None;
-    }
-    Fd out(::open(dst.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
-    if (!out.ok()) {
-        ec = errno_ec(errno);
-        return CopyMethod::None;
-    }
-    auto fail = [&](std::error_code e) {
-        ec = e;
-        out.reset();
-        ::unlink(dst.c_str());
-        return CopyMethod::None;
-    };
-    auto report = [&](uint64_t delta) { return !hooks.on_chunk || hooks.on_chunk(delta); };
-
-    CopyMethod method = CopyMethod::None;
-#if defined(__linux__) && defined(FICLONE)
-    if (hooks.allow_reflink) {
-        if (::ioctl(out.get(), FICLONE, in.get()) == 0) {
-            method = CopyMethod::Reflink;
-            bytes = static_cast<uint64_t>(ins.st_size);
-            if (!report(bytes)) return fail(make_error_code(Errc::cancelled));
-        } else if (::ftruncate(out.get(), 0) != 0) {
-            return fail(errno_ec(errno));
-        }
-    }
-#endif
-    if (hooks.require_reflink && method != CopyMethod::Reflink) {
-        return fail(std::make_error_code(std::errc::operation_not_supported));
-    }
-#ifdef __linux__
-    if (method == CopyMethod::None && hooks.allow_kernel_copy) {
-        bool fallback = false;
-        for (;;) {
-            ssize_t r = ::copy_file_range(in.get(), nullptr, out.get(), nullptr, 8u << 20, 0);
-            if (r < 0) {
-                int e = errno;
-                if (e == EINTR) continue;
-                if (bytes == 0 && (e == EXDEV || e == EINVAL || e == ENOSYS || e == EOPNOTSUPP || e == ENOTSUP ||
-                                   e == EPERM || e == EBADF)) {
-                    fallback = true;
-                    break;
-                }
-                return fail(errno_ec(e));
-            }
-            if (r == 0) {
-                // Some file systems (procfs-like) report 0 early; let the stream loop confirm EOF.
-                if (bytes < static_cast<uint64_t>(ins.st_size)) fallback = true;
-                break;
-            }
-            bytes += static_cast<uint64_t>(r);
-            if (!report(static_cast<uint64_t>(r))) return fail(make_error_code(Errc::cancelled));
-        }
-        if (!fallback) method = CopyMethod::KernelCopy;
-    }
-#endif
-    if (method == CopyMethod::None) {
-        std::vector<char> buf(hooks.buffer_size ? hooks.buffer_size : (1u << 20));
-        uint64_t streamed = 0;
-        for (;;) {
-            ssize_t r = ::read(in.get(), buf.data(), buf.size());
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                return fail(errno_ec(errno));
-            }
-            if (r == 0) break;
-            int err = 0;
-            if (!write_all(out.get(), buf.data(), static_cast<size_t>(r), err)) return fail(errno_ec(err));
-            bytes += static_cast<uint64_t>(r);
-            streamed += static_cast<uint64_t>(r);
-            if (!report(static_cast<uint64_t>(r))) return fail(make_error_code(Errc::cancelled));
-        }
-        method = streamed > 0 && bytes > streamed ? CopyMethod::KernelCopy : CopyMethod::Stream;
-    }
-
-    struct stat after;
-    if (::fstat(in.get(), &after) != 0) return fail(errno_ec(errno));
-    struct stat outs;
-    if (::fstat(out.get(), &outs) != 0) return fail(errno_ec(errno));
-    if (bytes != static_cast<uint64_t>(after.st_size) || static_cast<uint64_t>(outs.st_size) != bytes) {
-        return fail(make_error_code(Errc::incomplete_copy));
-    }
-
-#ifdef __linux__
-    if (hooks.preserve_metadata) copy_xattrs(in.get(), out.get(), dst, hooks.warnings);
-#endif
-    set_file_metadata(out.get(), dst, src_st, hooks.preserve_metadata, hooks.warnings);
-    if (hooks.sync && ::fsync(out.get()) != 0) return fail(errno_ec(errno));
-    int close_err = out.release_close(); // NFS and friends report write errors at close
-    if (close_err != 0) {
-        ec = errno_ec(close_err);
-        ::unlink(dst.c_str());
-        return CopyMethod::None;
-    }
-    return method;
-}
-
-void apply_metadata(const fs::path& dst, const Stat& st, std::vector<ItemError>* warnings) {
-    bool link = st.kind == FileKind::Symlink;
-    if (::geteuid() == 0 && ::lchown(dst.c_str(), st.uid, st.gid) != 0 && warnings) {
-        warnings->push_back({{}, dst, errno_ec(errno), "chown"});
-    }
-    if (!link && ::chmod(dst.c_str(), static_cast<mode_t>(st.mode & 07777)) != 0 && warnings) {
-        warnings->push_back({{}, dst, errno_ec(errno), "chmod"});
-    }
-    struct timespec ts[2];
-    ts[0].tv_sec = st.atime_ns / 1000000000;
-    ts[0].tv_nsec = st.atime_ns % 1000000000;
-    ts[1].tv_sec = st.mtime_ns / 1000000000;
-    ts[1].tv_nsec = st.mtime_ns % 1000000000;
-    if (::utimensat(AT_FDCWD, dst.c_str(), ts, link ? AT_SYMLINK_NOFOLLOW : 0) != 0 && warnings &&
-        !(link && errno == EOPNOTSUPP)) {
-        warnings->push_back({{}, dst, errno_ec(errno), "set times"});
-    }
-}
-
 void sync_dir(const fs::path& dir) {
-    Fd fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Fd fd(::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (fd.ok()) ::fsync(fd.get());
 }
 
-bool reflink_supported(const fs::path& dir) {
-#if defined(__linux__) && defined(FICLONE)
-    fs::path a = temp_sibling(dir), b = temp_sibling(dir);
-    Fd fa(::open(a.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
-    if (!fa.ok()) return false;
-    Fd fb(::open(b.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
-    bool ok = false;
-    if (fb.ok()) {
-        std::vector<char> block(64 * 1024, 'r');
-        int err = 0;
-        if (write_all(fa.get(), block.data(), block.size(), err)) ok = ::ioctl(fb.get(), FICLONE, fa.get()) == 0;
-        fb.reset();
-        ::unlink(b.c_str());
-    }
-    fa.reset();
-    ::unlink(a.c_str());
-    return ok;
-#else
-    (void)dir;
-    return false;
-#endif
-}
-
-} // namespace bro::vfs::sys
+} // namespace sys
+} // namespace bro::vfs
 
 #endif // !_WIN32

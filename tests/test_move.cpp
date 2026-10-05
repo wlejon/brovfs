@@ -191,6 +191,38 @@ static void test_forced_cross_device(const Scratch& s) {
     CHECK(path_exists(s / "trunc" / "big.bin") && !path_exists(s / "trunc" / "moved.bin"));
 #endif
 
+    section("cross-device path (forced): an ancestor swapped for a link cannot redirect source deletion");
+    {
+        fs::path src = s / "anc" / "src", moved = s / "anc" / "moved_a";
+        for (int i = 0; i < 4; ++i) write_file(src / "a" / "b" / ("f" + std::to_string(i)), "planned");
+        bool tried = false, swapped = false;
+        {
+            ForceCrossDevice force;
+            r = vfs::move_to(src, s / "anc" / "dst", vfs::FileOpOptions(), [&](const vfs::ProgressInfo& p) {
+                if (!tried && p.current_path == src / "a") { // planned, about to be recreated
+                    tried = true;
+                    std::error_code ec;
+                    fs::rename(L(src / "a"), L(moved), ec);
+#ifdef _WIN32
+                    swapped = !ec && make_junction(src / "a", moved);
+#else
+                    swapped = !ec && make_dir_symlink(src / "a", moved);
+#endif
+                }
+                return true;
+            });
+        }
+        CHECK(tried);
+        if (swapped) {
+            size_t left = 0;
+            for (int i = 0; i < 4; ++i) left += read_file(moved / "b" / ("f" + std::to_string(i))) == "planned";
+            CHECK_MSG(left == 4, "source files outside the tree were deleted");
+            CHECK_MSG(has_error(r, vfs::Errc::source_changed), describe(r));
+        } else {
+            note("could not stage the ancestor swap");
+        }
+    }
+
     section("a rename error that is not cross-device is reported, nothing copied or deleted");
     write_file(s / "nx" / "f.txt", "f");
     r = vfs::move_to(s / "nx" / "f.txt", s / "nx" / "missing_parent" / "f.txt");

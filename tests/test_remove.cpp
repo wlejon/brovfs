@@ -94,6 +94,38 @@ static void test_swap_after_plan(const Scratch& s) {
     }
 }
 
+// After planning, an ancestor of everything still to delete is moved out of the tree and
+// replaced by a link to where it went. Every planned object keeps its planned identity, so an
+// identity check on a re-resolved path would pass and delete outside the tree; reaching each
+// directory relative to its parent's handle never follows the link.
+static void test_ancestor_swap(const Scratch& s) {
+    section("an ancestor swapped for a link mid-delete cannot redirect it out of the tree");
+    fs::path root = s / "anc";
+    for (int i = 0; i < 5; ++i) write_file(root / "a" / "b" / ("f" + std::to_string(i)), "planned");
+    write_file(root / "z.txt", "z");
+    fs::path moved = s / "anc_moved_a";
+    bool swapped = false, tried = false;
+    auto r = vfs::remove({root}, [&](const vfs::ProgressInfo& p) {
+        if (!tried && !p.current_path.empty()) {
+            tried = true;
+            std::error_code ec;
+            fs::rename(L(root / "a"), L(moved), ec);
+            swapped = !ec && make_dir_link(root / "a", moved);
+        }
+        return true;
+    });
+    CHECK(tried);
+    if (!swapped) {
+        note("could not stage the ancestor swap");
+        return;
+    }
+    size_t left = 0;
+    for (int i = 0; i < 5; ++i) left += path_exists(moved / "b" / ("f" + std::to_string(i)));
+    CHECK_MSG(left == 5, "files outside the tree were deleted: " + std::to_string(5 - left) + " of 5 gone");
+    CHECK_MSG(has_error(r, vfs::Errc::source_changed), describe(r));
+    CHECK(path_exists(root / "a")); // the link itself is not ours to delete
+}
+
 static void test_names_and_attrs(const Scratch& s) {
     section("unicode, long paths, read-only");
     fs::path root = s / "uni";
@@ -162,6 +194,7 @@ int main() {
     Scratch s("remove");
     test_links(s);
     test_swap_after_plan(s);
+    test_ancestor_swap(s);
     test_names_and_attrs(s);
     test_partial(s);
     test_cancel(s);

@@ -14,6 +14,8 @@ set(BROVFS_TESTS
     test_worker
     test_mime
     test_volumes
+    test_watcher
+    test_metadata
 )
 
 foreach(name IN LISTS BROVFS_TESTS)

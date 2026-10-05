@@ -2,6 +2,10 @@
 
 #include "src/volumes_internal.h"
 #include <sys/statvfs.h>
+#ifdef __APPLE__
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -12,7 +16,7 @@ namespace bro::vfs::detail {
 
 namespace {
 
-bool is_pseudo_fs(const std::string& fs_type) {
+[[maybe_unused]] bool is_pseudo_fs(const std::string& fs_type) {
     static const std::unordered_set<std::string> pseudo_types = {
         "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "securityfs", "cgroup", "cgroup2",
         "pstore", "bpf", "debugfs", "tracefs", "hugetlbfs", "mqueue", "autofs", "fusectl",
@@ -23,6 +27,35 @@ bool is_pseudo_fs(const std::string& fs_type) {
 
 } // namespace
 
+#ifdef __APPLE__
+// macOS: getmntinfo. System-internal mounts (MNT_DONTBROWSE: Preboot, VM, Update, ...) are left
+// out, except the Data volume: /Users, /Applications, ... are firmlinked into it, so it is the
+// volume holding almost every user file.
+std::vector<VolumeInfo> list_volumes_platform() {
+    std::vector<VolumeInfo> volumes;
+    struct statfs* mnts = nullptr;
+    int n = ::getmntinfo(&mnts, MNT_NOWAIT);
+    for (int i = 0; i < n; ++i) {
+        const struct statfs& m = mnts[i];
+        std::string type = m.f_fstypename;
+        std::string on = m.f_mntonname;
+        if (type == "devfs" || type == "autofs" || type == "nullfs") continue;
+        if ((m.f_flags & MNT_DONTBROWSE) && on != "/System/Volumes/Data") continue;
+        VolumeInfo info;
+        info.mount_point = on;
+        info.volume_label = m.f_mntfromname;
+        info.fs_type = type;
+        info.total_bytes = static_cast<uint64_t>(m.f_blocks) * m.f_bsize;
+        info.free_bytes = static_cast<uint64_t>(m.f_bfree) * m.f_bsize;
+        info.available_bytes = static_cast<uint64_t>(m.f_bavail) * m.f_bsize;
+        info.is_read_only = (m.f_flags & MNT_RDONLY) != 0;
+        info.is_network = (m.f_flags & MNT_LOCAL) == 0;
+        info.is_removable = on.rfind("/Volumes/", 0) == 0 && (m.f_flags & MNT_LOCAL) != 0;
+        volumes.push_back(std::move(info));
+    }
+    return volumes;
+}
+#else
 std::vector<VolumeInfo> list_volumes_platform() {
     std::vector<VolumeInfo> volumes;
 
@@ -111,6 +144,7 @@ std::vector<VolumeInfo> list_volumes_platform() {
 
     return volumes;
 }
+#endif
 
 } // namespace bro::vfs::detail
 

@@ -1,5 +1,5 @@
-// Trash. Windows: the real Recycle Bin, touching only items this test created (all under its
-// scratch dir), restoring or erasing every one of them. POSIX: the freedesktop trash with the
+// Trash. Windows / macOS: the real Recycle Bin / Trash, touching only items this test created
+// (all under its scratch dir), restoring or erasing every one of them. POSIX (macOS too): the freedesktop trash with the
 // home trash and every top-directory trash inside scratch directories; trash-cli, when
 // installed, is used as an independent oracle with XDG_DATA_HOME pointed at scratch.
 #include "brovfs/trash.h"
@@ -11,6 +11,9 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <sys/xattr.h>
 #endif
 
 using namespace t;
@@ -113,10 +116,11 @@ static void common_checks(vfs::Trash& trash, const Scratch& s, const std::string
     CHECK(!trash.trash(s / "missing.txt", &id, ec));
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 
-// Erases this run's items, plus orphans of an earlier run of this test that died before its
-// cleanup: items from a "trash-*" scratch dir under the scratch base. Never anything else.
+// For the real system trash. Erases this run's items, plus orphans of an earlier run of this
+// test that died before its cleanup: items from a "trash-*" scratch dir under the scratch
+// base. Never anything else.
 static bool own_item(const vfs::TrashItem& item, const Scratch& s) {
     if (within(item.original_path, s.root())) return true;
     std::error_code ec;
@@ -136,6 +140,10 @@ static void cleanup_own_items(vfs::Trash& trash, const Scratch& s) {
     }
     if (n) note("cleanup erased " + std::to_string(n) + " leftover test item(s)");
 }
+
+#endif
+
+#ifdef _WIN32
 
 static void windows_specific(vfs::Trash& trash, const Scratch& s, const std::string& tag) {
     section("Recycle Bin: id names a $R entry of this user's bin");
@@ -380,8 +388,54 @@ static void trash_cli_oracle(const Scratch& s, const fs::path& xdg) {
     CHECK(!cid.empty() && trash->restore(cid, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(s / "cli" / "by_cli.txt") == "cli");
 }
 
+#ifdef __APPLE__
+// The real macOS Trash, touching only items this test created (all under its scratch dir).
+// The journal lives in scratch, so list() finds this run's items even without Full Disk
+// Access; leftovers of a run that died are found through the item xattrs when the trash is
+// listable.
+static void macos_trash(const Scratch& s) {
+    vfs::MacTrashConfig cfg;
+    cfg.journal = s / "journal" / "trash-journal";
+    cfg.search_volumes = false;
+    auto trash = vfs::make_macos_trash(cfg);
+    std::string tag = "brovfstest" + std::to_string(::getpid());
+    common_checks(*trash, s, tag);
+
+    section("macOS: restore data travels with the item and is removed on restore");
+    fs::path f = s / (tag + "_x.txt");
+    write_file(f, "x");
+    std::string id;
+    std::error_code ec;
+    CHECK_MSG(trash->trash(f, &id, ec), ec.message());
+    char buf[4096];
+    ssize_t n = ::getxattr(id.c_str(), "com.bro.vfs.putback", buf, sizeof(buf), 0, XATTR_NOFOLLOW);
+    CHECK(n > 0 && std::string(buf, static_cast<size_t>(n)) == f.native());
+    CHECK(read_file(cfg.journal).find(id) != std::string::npos);
+    CHECK(trash->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(f) == "x");
+    CHECK(::getxattr(f.c_str(), "com.bro.vfs.putback", buf, sizeof(buf), 0, XATTR_NOFOLLOW) < 0);
+    // The journal drops entries that are no longer in the trash.
+    (void)trash->list();
+    CHECK(read_file(cfg.journal).find(id) == std::string::npos);
+
+    section("macOS: symlinks are trashed as links; the trash itself is refused");
+    fs::create_symlink("target.txt", s / (tag + "_link"), ec);
+    write_file(s / "target.txt", "t");
+    CHECK_MSG(trash->trash(s / (tag + "_link"), &id, ec), ec.message());
+    CHECK(fs::is_symlink(fs::symlink_status(fs::path(id))) && read_file(s / "target.txt") == "t");
+    CHECK(trash->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && fs::is_symlink(fs::symlink_status(s / (tag + "_link"))));
+    CHECK(!trash->trash(fs::path(id).parent_path(), &id, ec));
+
+    cleanup_own_items(*trash, s);
+    for (auto& item : trash->list()) CHECK_MSG(!within(item.original_path, s.root()), u8(item.original_path));
+}
+#endif
+
 int main() {
     Scratch s("trash");
+#ifdef __APPLE__
+    macos_trash(s); // before XDG_DATA_HOME is redirected; touches only this run's items
+    CHECK(vfs::system_trash() != nullptr);
+#endif
     fs::path xdg = s / "xdg";
     ::setenv("XDG_DATA_HOME", xdg.c_str(), 1); // nothing in this process may reach the real trash
     fs::path home_trash = xdg / "Trash";

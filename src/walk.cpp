@@ -1,5 +1,6 @@
 #include "src/walk.h"
 
+#include <algorithm>
 #include <vector>
 
 #ifdef _WIN32
@@ -50,17 +51,17 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
         fs::path rel;
         uint32_t depth;
         int64_t index;
+        sys::Dir dir;
         std::vector<sys::RawEntry> children;
         size_t next = 0;
     };
     int64_t counter = 0;
     std::vector<Frame> stack;
 
-    auto open_frame = [&](const fs::path& path, const fs::path& rel, uint32_t depth, int64_t index,
-                          const fs::path& list_path) {
-        Frame f{path, rel, depth, index, {}, 0};
+    auto open_frame = [&](const fs::path& path, const fs::path& rel, uint32_t depth, int64_t index, sys::Dir&& dir) {
+        Frame f{path, rel, depth, index, std::move(dir), {}, 0};
         std::error_code ec;
-        bool ok = sys::list_dir(list_path, [&](sys::RawEntry&& e) {
+        bool ok = f.dir.list([&](sys::RawEntry&& e) {
             f.children.push_back(std::move(e));
             return !(token && token->is_cancelled());
         }, ec);
@@ -72,16 +73,15 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
         stack.push_back(std::move(f));
     };
 
-    fs::path root_list = root;
-    if (options.follow_root_link) {
-        sys::Stat rs;
+    {
+        sys::Dir rd;
         std::error_code ec;
-        if (sys::lstat(root, rs, ec) && is_link(rs.kind)) {
-            fs::path resolved = fs::canonical(root, ec);
-            if (!ec) root_list = resolved;
+        if (!sys::Dir::open(root, options.follow_root_link, rd, ec)) {
+            on_error(root, ec);
+            return !(token && token->is_cancelled());
         }
+        open_frame(root, fs::path(), 0, -1, std::move(rd));
     }
-    open_frame(root, fs::path(), 0, -1, root_list);
     while (!stack.empty()) {
         if (token && token->is_cancelled()) return false;
         Frame& top = stack.back();
@@ -105,9 +105,49 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
 
         bool descend = node.st.kind == FileKind::Directory && !node.stat_error &&
                        (options.max_depth == 0 || node.depth + 1 < options.max_depth);
-        if (descend) open_frame(node.path, node.rel, node.depth + 1, node.index, node.path); // invalidates `top`
+        if (descend) {
+            sys::Dir sub;
+            std::error_code ec;
+            if (top.dir.open_child(child.name, &node.st.id, sub, ec)) {
+                open_frame(node.path, node.rel, node.depth + 1, node.index, std::move(sub)); // invalidates `top`
+            } else {
+                on_error(node.path, ec);
+            }
+        }
     }
     return !(token && token->is_cancelled());
+}
+
+const sys::Dir* DirChain::get(int64_t index, std::error_code& ec, int64_t* failed) {
+    if (failed) *failed = index;
+    if (index < 0) {
+        if (!root_.ok()) {
+            ec = make_error_code(Errc::invalid_argument);
+            return nullptr;
+        }
+        return &root_;
+    }
+    std::vector<int64_t> chain;
+    for (int64_t i = index; i >= 0; i = parent_(i)) chain.push_back(i);
+    std::reverse(chain.begin(), chain.end());
+    size_t keep = 0;
+    while (keep < stack_.size() && keep < chain.size() && stack_[keep].first == chain[keep]) ++keep;
+    while (stack_.size() > keep) stack_.pop_back();
+    for (size_t k = keep; k < chain.size(); ++k) {
+        const sys::Dir& parent = k == 0 ? root_ : stack_[k - 1].second;
+        if (!parent.ok()) {
+            ec = make_error_code(Errc::invalid_argument);
+            return nullptr;
+        }
+        sys::Dir d;
+        FileId id = id_(chain[k]);
+        if (!parent.open_child(name_(chain[k]), &id, d, ec)) {
+            if (failed) *failed = chain[k];
+            return nullptr;
+        }
+        stack_.emplace_back(chain[k], std::move(d));
+    }
+    return &stack_.back().second;
 }
 
 } // namespace bro::vfs::detail
