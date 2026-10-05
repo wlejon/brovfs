@@ -17,6 +17,10 @@ struct TrashItem {
     int64_t deletion_time_ms = 0;
     uint64_t size = 0;       // directories: total size when the backend records it, else 0
     bool is_directory = false;
+    // macOS: Finder holds its own put-back record for the item (it trashed it, or brovfs asked
+    // it to), so Finder's "Put Back" works for it. Known only when the trash's .DS_Store is
+    // readable (Full Disk Access).
+    bool finder_put_back = false;
 };
 
 enum class RestoreConflict : uint8_t {
@@ -67,18 +71,38 @@ std::shared_ptr<Trash> make_freedesktop_trash(FreedesktopTrashConfig config = Fr
 #endif
 
 #ifdef __APPLE__
-// The macOS Trash through NSFileManager (-trashItemAtURL:), which picks the right trash for
-// the item's volume (~/.Trash, /Volumes/X/.Trashes/<uid>) and resolves name collisions.
-// Finder's own "Put Back" records live in Finder-private .DS_Store data that only Finder may
-// write, so items trashed here cannot be put back from Finder; brovfs records the original
-// path and deletion time in xattrs on the item itself (com.bro.vfs.putback /
-// com.bro.vfs.trashed, set before the move and removed on restore) and restores from those.
-// Enumerating a trash folder needs Full Disk Access on recent macOS; without it list()
-// reports the denial in `errors` and still lists every item brovfs trashed, from a journal of
-// stored paths (one per line).
+// The macOS Trash. brovfs records the original path and deletion time in xattrs on the item
+// itself (com.bro.vfs.putback / com.bro.vfs.trashed, set before the move, removed on restore),
+// so its own restore never depends on anything else.
+//
+// Interoperating with Finder:
+//  * Finder's "Put Back" reads records (ptbL / ptbN) in the trash folder's .DS_Store, which
+//    only Finder writes, and only for items Finder itself moved: NSFileManager, NSWorkspace
+//    and /usr/bin/trash leave none (verified on macOS 26: no record, no xattr). Writing
+//    .DS_Store behind Finder's back is unsound (Finder caches and rewrites it). The one honest
+//    way is to ask Finder to do the move (an Apple Event), which needs the user's Automation
+//    consent for this app to control Finder: see `finder`.
+//  * The other way round, items Finder trashed are listed with their original path and can be
+//    restored, from Finder's .DS_Store records. Reading those (and listing a trash folder at
+//    all) needs Full Disk Access on recent macOS.
+//
+// Without Full Disk Access list() reports the denial in `errors` and still lists every item
+// brovfs trashed, from a journal of stored paths (one per line). The journal entry is written
+// (as the predicted name) before the move, so a crash between move and journal cannot leave
+// an item brovfs trashed unfindable.
+enum class FinderTrash : uint8_t {
+    Never = 0,   // NSFileManager -trashItemAtURL: (no Finder put-back record)
+    IfPermitted, // through Finder when this process may automate it, else NSFileManager
+    Require,     // through Finder or not at all (operation_not_permitted without consent)
+};
+
 struct MacTrashConfig {
     fs::path journal; // empty = ~/Library/Application Support/brovfs/trash-journal
     bool search_volumes = true; // also list /Volumes/*/.Trashes/<uid>
+    FinderTrash finder = FinderTrash::Never;
+    // Let the system show its Automation consent prompt (once per app, blocking trash() until
+    // the user answers). False: only use consent the user already gave.
+    bool ask_finder_permission = false;
 };
 
 std::shared_ptr<Trash> make_macos_trash(MacTrashConfig config = MacTrashConfig());

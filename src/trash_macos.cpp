@@ -6,6 +6,7 @@
 #include "brovfs/file_ops.h"
 #include "brovfs/path.h"
 #include "brovfs/trash.h"
+#include "src/ds_store.h"
 #include "src/engine.h"
 #include "src/trash_macos.h"
 
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sys/file.h>
@@ -102,17 +104,40 @@ public:
             ec = make_error_code(Errc::invalid_argument); // never trash the trash
             return false;
         }
+        bool via_finder = false;
+        if (cfg_.finder != FinderTrash::Never) {
+            via_finder = detail::finder_permission(cfg_.ask_finder_permission) == 0;
+            if (!via_finder && cfg_.finder == FinderTrash::Require) {
+                ec = std::make_error_code(std::errc::operation_not_permitted);
+                return false;
+            }
+        }
         // Restore data first: an item is never in the trash without a way back.
         if (!set_x(p, kPutback, p.native(), ec) || !set_x(p, kTrashed, std::to_string(sys::now_unix_ms()), ec)) {
             rm_x(p);
             return false;
         }
+        // Journal the name the trash will most likely give it before moving, so a crash
+        // right after the move still leaves the item findable (a wrong guess is pruned).
+        fs::path tdir = detail::ns_trash_for(p);
+        fs::path predicted = tdir.empty() ? fs::path() : tdir / leaf_name(p);
+        if (!predicted.empty()) journal_add(predicted);
         fs::path stored;
-        if (!detail::ns_trash_item(p, stored, ec)) {
+        bool moved = via_finder ? detail::finder_trash_item(p, stored, ec) : detail::ns_trash_item(p, stored, ec);
+        if (!moved) {
             rm_x(p);
             return false;
         }
-        journal_add(stored);
+        if (stored.empty()) {
+            // Finder did not name the result: accept the predicted name only if it is this item.
+            std::string orig;
+            if (predicted.empty() || !get_x(predicted, kPutback, orig) || orig != p.native()) {
+                ec = make_error_code(Errc::trash_info_invalid); // moved; list() still finds it
+                return false;
+            }
+            stored = predicted;
+        }
+        if (stored != predicted) journal_add(stored);
         if (out_id) *out_id = stored.native();
         return true;
     }
@@ -120,19 +145,21 @@ public:
     std::vector<TrashItem> list(std::vector<ItemError>* errors) override {
         std::vector<TrashItem> out;
         std::set<std::string> seen;
+        FinderRecords finder;
         for (const auto& dir : trash_dirs()) {
             std::error_code ec;
             bool ok = sys::list_dir(dir, [&](sys::RawEntry&& e) {
                 if (e.name_utf8 == ".DS_Store" || e.name_utf8 == ".localized") return true;
                 fs::path stored = dir / e.name;
                 TrashItem item;
-                if (make_item(stored, item)) {
+                if (make_item(stored, item, finder)) {
                     seen.insert(stored.native());
                     out.push_back(std::move(item));
                 }
                 return true;
             }, ec);
             if (!ok && !sys::is_not_found(ec) && errors) errors->push_back({dir, {}, ec, "list"});
+            if (ok && finder.error(dir) && errors) errors->push_back({dir / ".DS_Store", {}, finder.error(dir), "read"});
         }
         // Items brovfs trashed, even where the folder could not be enumerated.
         std::lock_guard<std::mutex> lock(mutex_);
@@ -141,7 +168,8 @@ public:
         for (const auto& line : journal_read()) {
             fs::path stored(line);
             TrashItem item;
-            if (!valid_location(stored) || !make_item(stored, item) || item.original_path.empty()) {
+            bool ours = false;
+            if (!valid_location(stored) || !make_item(stored, item, finder, &ours) || !ours) {
                 changed = true; // restored, erased or emptied since
                 continue;
             }
@@ -159,8 +187,14 @@ public:
         if (!valid_id(id, stored, ec)) return false;
         std::string original;
         if (!get_x(stored, kPutback, original) || original.empty() || original[0] != '/') {
-            ec = make_error_code(Errc::trash_info_invalid);
-            return false;
+            // Not trashed by brovfs: Finder's own put-back record, if there is one.
+            FinderRecords finder;
+            TrashItem item;
+            if (!make_item(stored, item, finder) || item.original_path.empty()) {
+                ec = make_error_code(Errc::trash_info_invalid);
+                return false;
+            }
+            original = item.original_path.native();
         }
         fs::path target(original);
         if (sys::exists_nofollow(target)) {
@@ -268,12 +302,55 @@ private:
         return true;
     }
 
-    static bool make_item(const fs::path& stored, TrashItem& item) {
+    // Finder's put-back records per trash folder, read once per list()/restore().
+    class FinderRecords {
+    public:
+        const detail::FinderPutBack* find(const fs::path& stored) {
+            Dir& d = load(stored.parent_path());
+            auto it = d.records.find(leaf_name(stored).native());
+            return it == d.records.end() ? nullptr : &it->second;
+        }
+        std::error_code error(const fs::path& dir) { return load(dir).error; }
+
+    private:
+        struct Dir {
+            std::map<std::string, detail::FinderPutBack> records;
+            std::error_code error; // unreadable (other than absent)
+        };
+        Dir& load(const fs::path& dir) {
+            auto [it, fresh] = dirs_.try_emplace(dir.native());
+            if (fresh) {
+                std::error_code ec;
+                if (!detail::read_finder_putback(dir / ".DS_Store", it->second.records, ec) && ec != std::errc::no_such_file_or_directory) {
+                    it->second.error = ec;
+                }
+            }
+            return it->second;
+        }
+        std::map<std::string, Dir> dirs_;
+    };
+
+    // The volume a trash folder belongs to: "/" for the home trash, X for X/.Trashes/<uid>.
+    fs::path volume_root_of(const fs::path& trash_dir) const {
+        if (trash_dir == home_trash_) return "/";
+        return trash_dir.parent_path().parent_path();
+    }
+
+    bool make_item(const fs::path& stored, TrashItem& item, FinderRecords& finder, bool* ours = nullptr) const {
         sys::Stat st;
         std::error_code ec;
         if (!sys::lstat(stored, st, ec)) return false;
         std::string original, when;
         get_x(stored, kPutback, original);
+        if (ours) *ours = !original.empty();
+        const detail::FinderPutBack* pb = finder.find(stored);
+        item.finder_put_back = pb != nullptr;
+        if (original.empty() && pb) {
+            fs::path loc = fs::path(pb->location).relative_path();
+            bool sane = true;
+            for (const auto& c : loc) sane &= c != "..";
+            if (sane) original = (volume_root_of(stored.parent_path()) / loc / (pb->name.empty() ? leaf_name(stored).native() : pb->name)).native();
+        }
         item.id = stored.native();
         item.stored_path = stored;
         item.original_path = fs::path(original);
@@ -315,10 +392,12 @@ private:
         std::vector<std::string> now = journal_read();
         std::set<std::string> keep(lines.begin(), lines.end());
         std::string text;
+        FinderRecords finder;
         for (const auto& l : now) {
             fs::path stored(l);
             TrashItem item;
-            if (keep.count(l) || (valid_location(stored) && make_item(stored, item) && !item.original_path.empty())) {
+            bool ours = false;
+            if (keep.count(l) || (valid_location(stored) && make_item(stored, item, finder, &ours) && ours)) {
                 text += encode_line(l) + "\n";
             }
         }

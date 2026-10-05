@@ -324,7 +324,10 @@ Dir& Dir::operator=(Dir&& o) noexcept {
 }
 bool Dir::ok() const noexcept { return h_ != nullptr; }
 void Dir::close() noexcept {
-    if (h_) CloseHandle(static_cast<HANDLE>(h_));
+    if (h_) {
+        CloseHandle(static_cast<HANDLE>(h_));
+        count_dir_close();
+    }
     h_ = nullptr;
 }
 
@@ -341,6 +344,7 @@ bool Dir::open(const fs::path& p, bool follow_leaf, Dir& out, std::error_code& e
     Stat st;
     if (!stat_handle(h.get(), st, ec) || !check_is_dir(st, ec)) return false;
     out.h_ = h.release();
+    count_dir_open();
     return true;
 }
 
@@ -357,6 +361,7 @@ bool Dir::open_child(const fs::path& name, const FileId* expect, Dir& out, std::
         return false;
     }
     out.h_ = h.release();
+    count_dir_open();
     return true;
 }
 

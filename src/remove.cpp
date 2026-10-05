@@ -122,7 +122,8 @@ private:
         DirChain chain(
             std::move(root_dir), [&](int64_t i) { return nodes[static_cast<size_t>(i)].parent; },
             [&](int64_t i) { return nodes[static_cast<size_t>(i)].name; },
-            [&](int64_t i) { return nodes[static_cast<size_t>(i)].st.id; });
+            [&](int64_t i) { return nodes[static_cast<size_t>(i)].st.id; },
+            [&](int64_t i) { return nodes[static_cast<size_t>(i)].path; });
 
         // Reverse pre-order visits every child before its parent.
         std::vector<char> blocked(nodes.size(), 0);

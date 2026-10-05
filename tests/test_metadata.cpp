@@ -74,6 +74,63 @@ std::string read_stream(const fs::path& p, const std::wstring& stream) {
     return out;
 }
 
+// NTFS extended attributes through ntdll (an independent path from the library's).
+using NtSetEaFileFn = LONG(NTAPI*)(HANDLE, void*, PVOID, ULONG);
+using NtQueryEaFileFn = LONG(NTAPI*)(HANDLE, void*, PVOID, ULONG, BOOLEAN, PVOID, ULONG, PULONG, BOOLEAN);
+struct IoStatus {
+    void* status_or_pointer;
+    ULONG_PTR information;
+};
+
+HANDLE open_ea(const fs::path& p, DWORD access) {
+    std::wstring w = vfs::win_extended_path(p);
+    return CreateFileW(w.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+bool set_ea(const fs::path& p, const std::string& name, const std::string& value) {
+    auto fn = reinterpret_cast<NtSetEaFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetEaFile")));
+    std::vector<unsigned char> buf(8 + name.size() + 1 + value.size() + 4, 0);
+    buf[5] = static_cast<unsigned char>(name.size());
+    auto vl = static_cast<USHORT>(value.size());
+    std::memcpy(buf.data() + 6, &vl, 2);
+    std::memcpy(buf.data() + 8, name.data(), name.size());
+    std::memcpy(buf.data() + 8 + name.size() + 1, value.data(), value.size());
+    HANDLE h = open_ea(p, FILE_WRITE_EA);
+    if (h == INVALID_HANDLE_VALUE || !fn) return false;
+    IoStatus io{};
+    LONG st = fn(h, &io, buf.data(), static_cast<ULONG>(buf.size()));
+    CloseHandle(h);
+    return st >= 0;
+}
+
+// The value of EA `name` (NTFS stores names upper-cased), "<missing>" if absent.
+std::string get_ea(const fs::path& p, const std::string& name) {
+    auto fn = reinterpret_cast<NtQueryEaFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryEaFile")));
+    HANDLE h = open_ea(p, FILE_READ_EA);
+    if (h == INVALID_HANDLE_VALUE || !fn) return "<missing>";
+    std::vector<unsigned char> buf(1 << 17);
+    IoStatus io{};
+    LONG st = fn(h, &io, buf.data(), static_cast<ULONG>(buf.size()), FALSE, nullptr, 0, nullptr, TRUE);
+    CloseHandle(h);
+    if (st < 0) return "<missing>";
+    for (size_t off = 0;;) {
+        ULONG next = 0;
+        std::memcpy(&next, buf.data() + off, 4);
+        size_t nl = buf[off + 5];
+        USHORT vl = 0;
+        std::memcpy(&vl, buf.data() + off + 6, 2);
+        std::string n(reinterpret_cast<char*>(buf.data() + off + 8), nl);
+        if (_stricmp(n.c_str(), name.c_str()) == 0) {
+            return std::string(reinterpret_cast<char*>(buf.data() + off + 8 + nl + 1), vl);
+        }
+        if (next == 0) return "<missing>";
+        off += next;
+    }
+}
+
 PSID everyone() {
     static std::vector<unsigned char> sid;
     if (sid.empty()) {
@@ -326,14 +383,27 @@ void test_xattrs(const Scratch& s) {
         note("alternate data streams unsupported on this volume");
         return;
     }
+    const bool eas = set_ea(src / "f.txt", "BROVFS.FILE", "file ea") && set_ea(src / "d", "BROVFS.DIR", "dir ea");
+    if (!eas) note("extended attributes unsupported on this volume");
     auto r = vfs::copy_to(src, s / "xa" / "dst");
     CHECK_MSG(r.ok() && r.warnings.empty(), describe(r));
     CHECK(read_stream(s / "xa" / "dst" / "f.txt", L"meta") == "file stream");
     CHECK(read_stream(s / "xa" / "dst" / "d", L"meta") == "dir stream");
+    if (eas) {
+        CHECK(get_ea(s / "xa" / "dst" / "f.txt", "BROVFS.FILE") == "file ea");
+        CHECK(get_ea(s / "xa" / "dst" / "d", "BROVFS.DIR") == "dir ea");
+        // A forced cross-device move copies the directory, EAs included.
+        vfs::sys::g_force_cross_device = true;
+        r = vfs::move_to(s / "xa" / "dst", s / "xa" / "moved");
+        vfs::sys::g_force_cross_device = false;
+        CHECK_MSG(r.ok() && r.warnings.empty(), describe(r));
+        CHECK(get_ea(s / "xa" / "moved" / "d", "BROVFS.DIR") == "dir ea");
+    }
     vfs::FileOpOptions off;
     off.preserve_xattrs = false;
     r = vfs::copy_to(src, s / "xa" / "off", off);
     CHECK(r.ok() && read_stream(s / "xa" / "off" / "d", L"meta") == "<missing>");
+    CHECK(get_ea(s / "xa" / "off" / "d", "BROVFS.DIR") == "<missing>");
 #else
 #ifdef __APPLE__
     const char* name = "com.example.brovfs";

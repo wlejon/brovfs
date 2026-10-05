@@ -13,7 +13,11 @@
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
+#include <spawn.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
+extern char** environ;
+static const char* g_argv0 = "";
 #endif
 
 using namespace t;
@@ -131,7 +135,7 @@ static bool own_item(const vfs::TrashItem& item, const Scratch& s) {
            item.name.find("brovfstest") != std::string::npos;
 }
 
-static void cleanup_own_items(vfs::Trash& trash, const Scratch& s) {
+static int cleanup_own_items(vfs::Trash& trash, const Scratch& s) {
     int n = 0;
     for (auto& item : trash.list()) {
         if (!own_item(item, s)) continue; // never touch anything else
@@ -139,6 +143,7 @@ static void cleanup_own_items(vfs::Trash& trash, const Scratch& s) {
         if (trash.erase(item.id, ec)) ++n;
     }
     if (n) note("cleanup erased " + std::to_string(n) + " leftover test item(s)");
+    return n;
 }
 
 #endif
@@ -389,17 +394,125 @@ static void trash_cli_oracle(const Scratch& s, const fs::path& xdg) {
 }
 
 #ifdef __APPLE__
+static int run(const std::string& cmd) { return std::system(cmd.c_str()); }
+
+// Finder's put-back records, end to end on a disk image this test creates: an item in the
+// image's .Trashes/<uid> with a .DS_Store written by an independent library (fixture) is
+// listed with Finder's original path and restored there. No Full Disk Access needed: the
+// volume is ours.
+static void macos_finder_records(const Scratch& s) {
+    section("macOS: items Finder trashed are listed and restored from Finder's put-back records");
+    std::string vol = "brovfsT" + std::to_string(::getpid());
+    fs::path img = s / "finder.dmg";
+    fs::path mnt = fs::path("/Volumes") / vol;
+    if (run("hdiutil create -quiet -size 16m -fs APFS -volname " + vol + " '" + img.native() + "'") != 0 ||
+        run("hdiutil attach -quiet -nobrowse '" + img.native() + "'") != 0 || !path_exists(mnt)) {
+        note("could not create / attach a disk image; skipped");
+        return;
+    }
+    fs::path tdir = mnt / ".Trashes" / std::to_string(::getuid());
+    std::error_code ec;
+    fs::create_directories(tdir, ec);
+    fs::copy_file(fs::path(BROVFS_FIXTURES) / "trash.DS_Store", tdir / ".DS_Store", ec);
+    write_file(tdir / "file000.txt", "zero");
+    write_file(tdir / "file003.txt", "three");
+    write_file(tdir / "no-putback.txt", "?");
+    vfs::MacTrashConfig cfg;
+    cfg.journal = s / "finder-journal";
+    auto trash = vfs::make_macos_trash(cfg);
+    auto items = trash->list();
+    auto get = [&](const char* leaf) {
+        std::optional<vfs::TrashItem> r;
+        for (auto& i : items) {
+            if (i.stored_path == tdir / leaf) r = i;
+        }
+        return r;
+    };
+    auto f0 = get("file000.txt"), f3 = get("file003.txt"), fn = get("no-putback.txt");
+    CHECK(f0 && f0->finder_put_back && f0->original_path == mnt / "Users/j/Desktop/dir0/file000.txt");
+    CHECK(f3 && f3->finder_put_back && f3->original_path == mnt / "Users/j/Desktop/dir3/orig003.txt" &&
+          f3->name == "orig003.txt");
+    CHECK(fn && !fn->finder_put_back && fn->original_path.empty());
+    fs::path to;
+    CHECK_MSG(f3 && trash->restore(f3->id, vfs::RestoreConflict::Fail, &to, ec), ec.message());
+    CHECK(to == mnt / "Users/j/Desktop/dir3/orig003.txt" && read_file(to) == "three");
+    CHECK(fn && !trash->restore(fn->id, vfs::RestoreConflict::Fail, nullptr, ec) && ec == vfs::Errc::trash_info_invalid);
+    run("hdiutil detach -quiet -force '" + mnt.native() + "'");
+}
+
+// Asking Finder to trash needs Automation consent, which a test (often over ssh) cannot give.
+// Require refuses without touching the item; IfPermitted falls back to NSFileManager.
+static void macos_finder_mode(vfs::Trash& plain, const Scratch& s, const std::string& tag, const fs::path& journal) {
+    section("macOS: trashing through Finder only with the user's Automation consent");
+    vfs::MacTrashConfig req;
+    req.journal = journal;
+    req.search_volumes = false;
+    req.finder = vfs::FinderTrash::Require;
+    auto finder = vfs::make_macos_trash(req);
+    fs::path f = s / (tag + "_finder.txt");
+    write_file(f, "f");
+    std::string id;
+    std::error_code ec;
+    bool ok = finder->trash(f, &id, ec);
+    if (ok) {
+        note("Finder automation is permitted here: trashed through Finder");
+        CHECK(!path_exists(f) && path_exists(fs::path(id)));
+        CHECK_MSG(finder->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(f) == "f", ec.message());
+    } else {
+        note("no Automation consent for Finder: " + ec.message());
+        CHECK(ec == std::errc::operation_not_permitted && read_file(f) == "f");
+        char buf[8];
+        CHECK(::getxattr(f.c_str(), "com.bro.vfs.putback", buf, sizeof(buf), 0, XATTR_NOFOLLOW) < 0);
+    }
+    req.finder = vfs::FinderTrash::IfPermitted;
+    auto maybe = vfs::make_macos_trash(req);
+    CHECK_MSG(maybe->trash(f, &id, ec), ec.message());
+    CHECK(!path_exists(f) && plain.restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(f) == "f");
+}
+
 // The real macOS Trash, touching only items this test created (all under its scratch dir).
-// The journal lives in scratch, so list() finds this run's items even without Full Disk
-// Access; leftovers of a run that died are found through the item xattrs when the trash is
-// listable.
+// The journal is persistent across runs (next to the scratch dirs, not inside one) and gets
+// each item's predicted trash name before the move, so the leftovers of a run that died at any
+// point are found and erased by the next run even without Full Disk Access.
 static void macos_trash(const Scratch& s) {
     vfs::MacTrashConfig cfg;
-    cfg.journal = s / "journal" / "trash-journal";
+    cfg.journal = fs::absolute(scratch_base()) / "macos-trash-test-journal";
     cfg.search_volumes = false;
     auto trash = vfs::make_macos_trash(cfg);
+    cleanup_own_items(*trash, s); // a crashed earlier run
     std::string tag = "brovfstest" + std::to_string(::getpid());
+
+    section("macOS: an item trashed by a run that died is found and erased by the next one");
+    {
+        // A child process trashes an item and exits without any cleanup, like a crash.
+        fs::path f = s / (tag + "_orphan.txt");
+        write_file(f, "orphan");
+        pid_t pid = 0;
+        std::string a0 = g_argv0, a1 = "--orphan", a2 = f.native(), a3 = cfg.journal.native();
+        char* args[] = {a0.data(), a1.data(), a2.data(), a3.data(), nullptr};
+        int status = -1;
+        if (::posix_spawn(&pid, g_argv0, nullptr, nullptr, args, environ) == 0) ::waitpid(pid, &status, 0);
+        CHECK(status == 0 && !path_exists(f));
+        CHECK(cleanup_own_items(*trash, s) >= 1);
+        bool still = false;
+        for (auto& item : trash->list()) still |= item.original_path == f;
+        CHECK(!still);
+    }
+
     common_checks(*trash, s, tag);
+    macos_finder_mode(*trash, s, tag, cfg.journal);
+
+    section("macOS: the persistent journal records each trashed item");
+    {
+        fs::path f = s / (tag + "_pre.txt");
+        write_file(f, "p");
+        std::string id;
+        std::error_code ec;
+        CHECK(trash->trash(f, &id, ec));
+        std::string j = read_file(cfg.journal);
+        CHECK(j.find(id) != std::string::npos);
+        CHECK(trash->restore(id, vfs::RestoreConflict::Fail, nullptr, ec));
+    }
 
     section("macOS: restore data travels with the item and is removed on restore");
     fs::path f = s / (tag + "_x.txt");
@@ -430,10 +543,27 @@ static void macos_trash(const Scratch& s) {
 }
 #endif
 
-int main() {
+int main(int argc, char** argv) {
+#ifdef __APPLE__
+    g_argv0 = argv[0];
+    if (argc == 4 && std::string(argv[1]) == "--orphan") {
+        // Child of the "run that died" check: trash one item, exit without cleanup.
+        vfs::MacTrashConfig cfg;
+        cfg.journal = argv[3];
+        cfg.search_volumes = false;
+        std::string id;
+        std::error_code ec;
+        bool ok = vfs::make_macos_trash(cfg)->trash(argv[2], &id, ec);
+        ::_exit(ok ? 0 : 1);
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
     Scratch s("trash");
 #ifdef __APPLE__
     macos_trash(s); // before XDG_DATA_HOME is redirected; touches only this run's items
+    macos_finder_records(s);
     CHECK(vfs::system_trash() != nullptr);
 #endif
     fs::path xdg = s / "xdg";

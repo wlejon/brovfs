@@ -19,6 +19,11 @@ OpResult trash_paths(Trash& trash, const std::vector<fs::path>& paths,
         std::string id;
         std::error_code ec;
         if (trash.trash(p, &id, ec)) {
+            DoneItem d;
+            d.action = DoneItem::Action::Trashed;
+            d.source = p;
+            d.trash_id = id;
+            r.done.push_back(std::move(d));
             r.trash_ids.push_back(id);
             ++r.files_done;
         } else {

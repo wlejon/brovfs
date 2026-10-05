@@ -83,6 +83,8 @@ enum class Errc {
     cancelled,
     invalid_argument,
     directory_not_empty_after_move, // entries appeared in the source while it was being moved
+    not_reversible,               // undo of something whose previous state is gone (an overwrite)
+    target_changed,               // undo / redo: the item was changed since the operation
 };
 
 [[nodiscard]] const std::error_category& vfs_category() noexcept;
@@ -106,8 +108,21 @@ enum class Outcome : uint8_t {
 
 [[nodiscard]] std::string_view to_string(Outcome o) noexcept;
 
+// One thing an operation did, enough to reverse it (undo.h): per top-level item, and per
+// child where a move or copy merged into an existing directory (the topmost items it
+// created or moved there).
+struct DoneItem {
+    enum class Action : uint8_t { Copied = 0, Moved, Trashed };
+    Action action = Action::Copied;
+    fs::path source;         // copy / move source; trash: the original path
+    fs::path destination;    // where it is now; trash: the stored path when known
+    std::string trash_id;    // Trashed
+    bool replaced = false;   // an existing destination was overwritten (its old data is gone)
+};
+
 struct OpResult {
     Outcome outcome = Outcome::Success;
+    std::vector<DoneItem> done;        // what was done, in order (for undo)
     std::vector<ItemError> errors;     // per-item failures: the operation is NOT complete if non-empty
     std::vector<ItemError> warnings;   // metadata that could not be preserved; data is intact
     std::vector<fs::path> created;     // top-level destinations created (for undo)

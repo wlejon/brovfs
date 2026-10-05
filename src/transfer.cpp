@@ -51,6 +51,15 @@ private:
         res_.errors.push_back({s, d, ec, op});
     }
 
+    void done(bool moved, const fs::path& src, const fs::path& dst, bool replaced) {
+        DoneItem d;
+        d.action = moved ? DoneItem::Action::Moved : DoneItem::Action::Copied;
+        d.source = src;
+        d.destination = dst;
+        d.replaced = replaced;
+        res_.done.push_back(std::move(d));
+    }
+
     void count(const sys::Stat& st) {
         if (st.kind == FileKind::Regular) {
             ++res_.files_done;
@@ -163,6 +172,7 @@ private:
                 if (sys::rename_noreplace(src, dst, ec)) {
                     count(ss);
                     res_.created.push_back(dst);
+                    done(true, src, dst, false);
                 } else {
                     fail(src, dst, ec, "rename");
                 }
@@ -209,6 +219,7 @@ private:
                 if (move_rename(src, dst, false, ec)) {
                     count(ss);
                     if (top) res_.created.push_back(dst);
+                    done(true, src, dst, false);
                     prog_.add_totals(0, 1);
                     prog_.end_item();
                     return;
@@ -240,6 +251,7 @@ private:
                     if (move_rename(src, dst, true, ec)) {
                         count(ss);
                         if (top) res_.created.push_back(dst);
+                        done(true, src, dst, true);
                         prog_.add_totals(0, 1);
                         prog_.end_item();
                         return;
@@ -449,6 +461,7 @@ private:
                 return ItemState::Failed;
             }
             count(st);
+            last_replaced_ = overwrite;
             if (!link_to && meta().enabled && meta().acls) sys::apply_acl_committed(src, dst, st, meta(), &res_.warnings);
             if (linked && !link_to) links_.emplace(link_key(st), dst);
             if (final_dst) *final_dst = dst;
@@ -526,9 +539,9 @@ private:
             if (!prog_.begin_item(src)) return;
             fs::path final_dst;
             if (place_nondir(src, ss, dst, remove_source, preset_overwrite, &final_dst,
-                             remove_source ? &src_parent : nullptr) == ItemState::Done &&
-                top) {
-                res_.created.push_back(final_dst);
+                             remove_source ? &src_parent : nullptr) == ItemState::Done) {
+                if (top) res_.created.push_back(final_dst);
+                done(remove_source, src, final_dst, last_replaced_);
             }
             prog_.end_item();
             return;
@@ -585,7 +598,8 @@ private:
         DirChain chain(
             std::move(src_root), [&](int64_t i) { return nodes[static_cast<size_t>(i)].parent; },
             [&](int64_t i) { return nodes[static_cast<size_t>(i)].leaf; },
-            [&](int64_t i) { return nodes[static_cast<size_t>(i)].st.id; });
+            [&](int64_t i) { return nodes[static_cast<size_t>(i)].st.id; },
+            [&](int64_t i) { return nodes[static_cast<size_t>(i)].src; });
         auto source_dir = [&](const Node& nd) -> const sys::Dir* {
             std::error_code ec;
             const sys::Dir* d = chain.get(nd.parent, ec);
@@ -597,7 +611,7 @@ private:
         const size_t n = nodes.size();
         std::vector<ItemState> state(n, ItemState::Pending);
         std::vector<fs::path> dsts(n);
-        std::vector<char> created(n, 0), blocked(n, 0);
+        std::vector<char> created(n, 0), blocked(n, 0), replaced(n, 0);
         for (size_t i = 0; i < n && !stop(); ++i) {
             Node& nd = nodes[i];
             ItemState ps = nd.parent < 0 ? ItemState::Done : state[static_cast<size_t>(nd.parent)];
@@ -620,7 +634,8 @@ private:
                 if (remove_source && !sd) {
                     state[i] = ItemState::Failed; // nothing copied that could not then be removed
                 } else {
-                    state[i] = place_nondir(nd.src, nd.st, dsts[i], remove_source, false, nullptr, sd);
+                    state[i] = place_nondir(nd.src, nd.st, dsts[i], remove_source, false, &dsts[i], sd);
+                    replaced[i] = state[i] == ItemState::Done && last_replaced_;
                 }
             }
             prog_.end_item();
@@ -660,6 +675,7 @@ private:
             }
         }
         chain.close();
+        record_done(nodes, state, created, replaced, dsts, remove_source, src, root_dst, root_created);
         if (root_created) sys::apply_metadata(src, root_dst, ss, meta(), &res_.warnings);
         if (remove_source && !root_blocked && !stop()) {
             std::error_code ec;
@@ -670,6 +686,32 @@ private:
         }
     }
 
+    // A created root is one item; a root merged into an existing directory is the topmost
+    // items created (or moved) inside the merged directories.
+    void record_done(const std::vector<Node>& nodes, const std::vector<ItemState>& state,
+                     const std::vector<char>& created, const std::vector<char>& replaced,
+                     const std::vector<fs::path>& dsts, bool moved, const fs::path& src, const fs::path& root_dst,
+                     bool root_created) {
+        if (root_created) {
+            done(moved, src, root_dst, false);
+            return;
+        }
+        std::vector<char> merged(nodes.size(), 0);
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& nd = nodes[i];
+            const bool in_merged = nd.parent < 0 || merged[static_cast<size_t>(nd.parent)];
+            if (!in_merged || state[i] != ItemState::Done) continue;
+            if (nd.st.kind != FileKind::Directory) {
+                done(moved, nd.src, dsts[i], replaced[i] != 0);
+            } else if (created[i]) {
+                done(moved, nd.src, dsts[i], false);
+            } else {
+                merged[i] = 1;
+            }
+        }
+    }
+
+    bool last_replaced_ = false; // the last place_nondir committed over an existing object
     std::map<LinkKey, fs::path> links_; // hard-link set -> its first committed copy
 
     TransferMode mode_;

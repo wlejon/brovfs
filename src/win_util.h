@@ -91,6 +91,9 @@ bool stat_handle(HANDLE h, sys::Stat& out, std::error_code& ec);
 // sys_win_meta.cpp
 void copy_security(const fs::path& src, const fs::path& dst, bool owner, std::vector<ItemError>* warnings);
 void copy_streams(const fs::path& src, const fs::path& dst, std::vector<ItemError>* warnings);
+// NTFS extended attributes (FILE_FULL_EA_INFORMATION; e.g. WSL's $LXUID/$LXMOD), which
+// CopyFile2 carries for files but nothing carries for directories.
+void copy_eas(const fs::path& src, const fs::path& dst, std::vector<ItemError>* warnings);
 bool set_birth_time(const fs::path& dst, int64_t btime_ns, std::error_code& ec);
 
 // REPARSE_DATA_BUFFER lives in the DDK (ntifs.h); this is its documented layout.

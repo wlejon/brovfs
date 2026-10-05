@@ -235,7 +235,10 @@ void apply_metadata(const fs::path& src, const fs::path& dst, const Stat& st, co
                     std::vector<ItemError>* warnings) {
     if (!meta.enabled) return;
     if (st.kind == FileKind::Directory) {
-        if (meta.xattrs) copy_streams(src, dst, warnings);
+        if (meta.xattrs) {
+            copy_streams(src, dst, warnings);
+            copy_eas(src, dst, warnings);
+        }
         if (meta.acls) copy_security(src, dst, meta.owner, warnings);
     }
     Handle h = open_nofollow(dst, FILE_WRITE_ATTRIBUTES);

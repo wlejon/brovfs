@@ -16,12 +16,17 @@ set(BROVFS_TESTS
     test_volumes
     test_watcher
     test_metadata
+    test_deep
+    test_dsstore
+    test_model
+    test_undo
 )
 
 foreach(name IN LISTS BROVFS_TESTS)
     add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE brovfs)
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR})
+    target_compile_definitions(${name} PRIVATE BROVFS_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     if(MSVC)
         target_compile_options(${name} PRIVATE /W4 /permissive- /utf-8)
         target_compile_definitions(${name} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -33,7 +38,6 @@ endforeach()
 if(WIN32)
     target_link_libraries(test_trash PRIVATE shell32 ole32)
 endif()
-
 # Manual oracle, not a ctest: `find dir -type f | probe_mime_tool` vs `file --mime-type -f -`.
 add_executable(probe_mime_tool probe_mime_tool.cpp)
 target_link_libraries(probe_mime_tool PRIVATE brovfs)

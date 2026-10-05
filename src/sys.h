@@ -88,6 +88,13 @@ private:
 #endif
 };
 
+// Directory handles open right now (every Dir of the process) and the most ever open at once;
+// traversals keep this bounded however deep the tree is.
+extern std::atomic<int> g_open_dirs;
+extern std::atomic<int> g_open_dirs_peak;
+void count_dir_open() noexcept;
+void count_dir_close() noexcept;
+
 bool read_link_target(const fs::path& link, std::string& target_utf8, std::error_code& ec);
 
 // Fails with EEXIST / ERROR_ALREADY_EXISTS (mapped to std::errc::file_exists) if `to` exists.

@@ -72,7 +72,10 @@ struct FileOpOptions {
     // each other in the copy too, instead of becoming independent copies.
     bool preserve_hard_links = true;
     bool sync = false;              // flush every file before commit (always done before a move deletes its source)
-    bool allow_reflink = true;      // try a CoW clone first: FICLONE on Linux, clonefile on macOS
+    // Try a CoW clone first: FICLONE on Linux, clonefile on macOS. False guarantees a physical
+    // copy on Linux too (copy_file_range, which btrfs / XFS turn into a clone, is then skipped
+    // on file systems that can clone). Windows: CopyFile2 may block-clone on ReFS regardless.
+    bool allow_reflink = true;
     bool allow_kernel_copy = true;  // copy_file_range on Linux; CopyFile2 on Windows is always used
     size_t buffer_size = 1u << 20;
 };

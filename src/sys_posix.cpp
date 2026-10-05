@@ -284,7 +284,10 @@ Dir& Dir::operator=(Dir&& o) noexcept {
 }
 bool Dir::ok() const noexcept { return fd_ >= 0; }
 void Dir::close() noexcept {
-    if (fd_ >= 0) ::close(fd_);
+    if (fd_ >= 0) {
+        ::close(fd_);
+        count_dir_close();
+    }
     fd_ = -1;
 }
 
@@ -297,6 +300,7 @@ bool Dir::open(const fs::path& p, bool follow_leaf, Dir& out, std::error_code& e
         return false;
     }
     out.fd_ = fd;
+    count_dir_open();
     return true;
 }
 
@@ -328,6 +332,7 @@ bool Dir::open_child(const fs::path& name, const FileId* expect, Dir& out, std::
     }
     if (!matches(fd.get(), expect, ec)) return false;
     out.fd_ = fd.release();
+    count_dir_open();
     return true;
 }
 

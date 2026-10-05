@@ -1,6 +1,7 @@
 // Foundation side of the macOS trash: the only Objective-C in brovfs.
 #ifdef __APPLE__
 
+#import <CoreServices/CoreServices.h>
 #import <Foundation/Foundation.h>
 
 #include "src/trash_macos.h"
@@ -58,6 +59,80 @@ bool ns_trash_item(const fs::path& p, fs::path& stored, std::error_code& ec) {
             return false;
         }
         stored = fs::path(out.path.fileSystemRepresentation);
+        return true;
+    }
+}
+
+fs::path ns_trash_for(const fs::path& p) {
+    @autoreleasepool {
+        NSFileManager* fm = [NSFileManager defaultManager];
+        NSString* s = [fm stringWithFileSystemRepresentation:p.c_str() length:std::strlen(p.c_str())];
+        if (!s) return {};
+        NSURL* url = [fm URLForDirectory:NSTrashDirectory
+                                inDomain:NSUserDomainMask
+                       appropriateForURL:[NSURL fileURLWithPath:s]
+                                  create:NO
+                                   error:nil];
+        return url ? fs::path(url.path.fileSystemRepresentation) : fs::path();
+    }
+}
+
+namespace {
+NSAppleEventDescriptor* finder_target() {
+    return [NSAppleEventDescriptor descriptorWithBundleIdentifier:@"com.apple.finder"];
+}
+} // namespace
+
+int finder_permission(bool ask) {
+    @autoreleasepool {
+        return static_cast<int>(
+            AEDeterminePermissionToAutomateTarget(finder_target().aeDesc, kCoreEventClass, kAEDelete, ask ? true : false));
+    }
+}
+
+bool finder_trash_item(const fs::path& p, fs::path& stored, std::error_code& ec) {
+    @autoreleasepool {
+        stored.clear();
+        NSFileManager* fm = [NSFileManager defaultManager];
+        NSString* s = [fm stringWithFileSystemRepresentation:p.c_str() length:std::strlen(p.c_str())];
+        if (!s) {
+            ec = make_error_code(Errc::invalid_argument);
+            return false;
+        }
+        NSAppleEventDescriptor* target = finder_target();
+        NSAppleEventDescriptor* del = [NSAppleEventDescriptor appleEventWithEventClass:kCoreEventClass
+                                                                               eventID:kAEDelete
+                                                                      targetDescriptor:target
+                                                                              returnID:kAutoGenerateReturnID
+                                                                         transactionID:kAnyTransactionID];
+        [del setParamDescriptor:[NSAppleEventDescriptor descriptorWithFileURL:[NSURL fileURLWithPath:s]]
+                     forKeyword:keyDirectObject];
+        NSError* err = nil;
+        NSAppleEventDescriptor* reply = [del sendEventWithOptions:NSAppleEventSendWaitForReply timeout:60 error:&err];
+        if (!reply) {
+            ec = err && [err.domain isEqualToString:NSOSStatusErrorDomain] && err.code == errAEEventNotPermitted
+                     ? std::make_error_code(std::errc::operation_not_permitted)
+                     : map_error(err);
+            return false;
+        }
+        NSAppleEventDescriptor* fail = [reply paramDescriptorForKeyword:keyErrorNumber];
+        if (fail && fail.int32Value != 0) {
+            ec = std::make_error_code(std::errc::io_error);
+            return false;
+        }
+        // The reply names the trashed item as a Finder object; ask Finder for it as a file URL.
+        NSAppleEventDescriptor* item = [reply paramDescriptorForKeyword:keyDirectObject];
+        if (!item) return true;
+        NSAppleEventDescriptor* get = [NSAppleEventDescriptor appleEventWithEventClass:kAECoreSuite
+                                                                               eventID:kAEGetData
+                                                                      targetDescriptor:target
+                                                                              returnID:kAutoGenerateReturnID
+                                                                         transactionID:kAnyTransactionID];
+        [get setParamDescriptor:item forKeyword:keyDirectObject];
+        [get setParamDescriptor:[NSAppleEventDescriptor descriptorWithTypeCode:typeFileURL] forKeyword:keyAERequestedType];
+        NSAppleEventDescriptor* got = [get sendEventWithOptions:NSAppleEventSendWaitForReply timeout:30 error:nil];
+        NSURL* url = [[got paramDescriptorForKeyword:keyDirectObject] fileURLValue];
+        if (url.path) stored = fs::path(url.path.fileSystemRepresentation);
         return true;
     }
 }

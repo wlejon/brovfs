@@ -43,6 +43,33 @@ FileEntry make_entry(const fs::path& path, std::string name, const sys::Stat& st
     return e;
 }
 
+std::atomic<size_t> g_dir_handle_budget{32};
+
+namespace {
+size_t budget() { return std::max<size_t>(2, g_dir_handle_budget.load(std::memory_order_relaxed)); }
+} // namespace
+
+bool reopen_dir(const fs::path& p, const FileId& expect, bool follow_leaf, sys::Dir& out, std::error_code& ec) {
+    if (!sys::Dir::open(p, follow_leaf, out, ec)) {
+        if (expect.valid && (sys::is_not_found(ec) || ec == std::errc::too_many_symbolic_link_levels ||
+                             ec == std::errc::not_a_directory)) {
+            ec = make_error_code(Errc::source_changed);
+        }
+        return false;
+    }
+    sys::Stat st;
+    if (!out.stat(st, ec)) {
+        out.close();
+        return false;
+    }
+    if (expect.valid && !(st.id == expect)) {
+        out.close();
+        ec = make_error_code(Errc::source_changed);
+        return false;
+    }
+    return true;
+}
+
 bool walk(const fs::path& root, const WalkOptions& options, const CancellationToken* token,
           const std::function<bool(const WalkNode&)>& on_node,
           const std::function<void(const fs::path&, const std::error_code&)>& on_error) {
@@ -51,16 +78,21 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
         fs::path rel;
         uint32_t depth;
         int64_t index;
-        sys::Dir dir;
+        FileId id;      // the identity this directory was opened with
+        sys::Dir dir;   // closed when the frame is out of the handle budget
         std::vector<sys::RawEntry> children;
         size_t next = 0;
     };
     int64_t counter = 0;
     std::vector<Frame> stack;
+    size_t open_handles = 0;
+    size_t lowest_open = 0; // frames below this index have no handle
 
     auto open_frame = [&](const fs::path& path, const fs::path& rel, uint32_t depth, int64_t index, sys::Dir&& dir) {
-        Frame f{path, rel, depth, index, std::move(dir), {}, 0};
+        Frame f{path, rel, depth, index, {}, std::move(dir), {}, 0};
         std::error_code ec;
+        sys::Stat st;
+        if (f.dir.stat(st, ec)) f.id = st.id;
         bool ok = f.dir.list([&](sys::RawEntry&& e) {
             f.children.push_back(std::move(e));
             return !(token && token->is_cancelled());
@@ -71,6 +103,21 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
             on_error(path, ec);
         }
         stack.push_back(std::move(f));
+        ++open_handles;
+        lowest_open = std::min(lowest_open, stack.size() - 1);
+        // Over budget: drop the handles nearest the root; they are reopened when needed.
+        while (open_handles > budget() && lowest_open + 1 < stack.size()) {
+            if (stack[lowest_open].dir.ok()) {
+                stack[lowest_open].dir.close();
+                --open_handles;
+            }
+            ++lowest_open;
+        }
+    };
+    auto pop_frame = [&] {
+        if (stack.back().dir.ok()) --open_handles;
+        stack.pop_back();
+        lowest_open = std::min(lowest_open, stack.size());
     };
 
     {
@@ -86,7 +133,7 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
         if (token && token->is_cancelled()) return false;
         Frame& top = stack.back();
         if (top.next >= top.children.size()) {
-            stack.pop_back();
+            pop_frame();
             continue;
         }
         sys::RawEntry& child = top.children[top.next++];
@@ -108,6 +155,17 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
         if (descend) {
             sys::Dir sub;
             std::error_code ec;
+            if (!top.dir.ok()) {
+                // Dropped for the budget: reopen it, and only if it is still this directory.
+                const bool is_root = stack.size() == 1;
+                if (reopen_dir(top.path, top.id, is_root && options.follow_root_link, top.dir, ec)) {
+                    ++open_handles;
+                    lowest_open = std::min(lowest_open, stack.size() - 1);
+                } else {
+                    on_error(node.path, ec);
+                    continue;
+                }
+            }
             if (top.dir.open_child(child.name, &node.st.id, sub, ec)) {
                 open_frame(node.path, node.rel, node.depth + 1, node.index, std::move(sub)); // invalidates `top`
             } else {
@@ -133,12 +191,21 @@ const sys::Dir* DirChain::get(int64_t index, std::error_code& ec, int64_t* faile
     size_t keep = 0;
     while (keep < stack_.size() && keep < chain.size() && stack_[keep].first == chain[keep]) ++keep;
     while (stack_.size() > keep) stack_.pop_back();
-    for (size_t k = keep; k < chain.size(); ++k) {
-        const sys::Dir& parent = k == 0 ? root_ : stack_[k - 1].second;
-        if (!parent.ok()) {
-            ec = make_error_code(Errc::invalid_argument);
+    if (!root_.ok()) {
+        ec = make_error_code(Errc::invalid_argument);
+        return nullptr;
+    }
+    // The deepest kept level may have been dropped for the budget: reopen it by path.
+    if (keep > 0 && !stack_[keep - 1].second.ok()) {
+        int64_t i = stack_[keep - 1].first;
+        if (!reopen_dir(path_(i), id_(i), false, stack_[keep - 1].second, ec)) {
+            if (failed) *failed = i;
+            stack_.pop_back();
             return nullptr;
         }
+    }
+    for (size_t k = keep; k < chain.size(); ++k) {
+        const sys::Dir& parent = k == 0 ? root_ : stack_[k - 1].second;
         sys::Dir d;
         FileId id = id_(chain[k]);
         if (!parent.open_child(name_(chain[k]), &id, d, ec)) {
@@ -146,6 +213,10 @@ const sys::Dir* DirChain::get(int64_t index, std::error_code& ec, int64_t* faile
             return nullptr;
         }
         stack_.emplace_back(chain[k], std::move(d));
+        // Keep the root's handle and the deepest budget-1 levels; the next level down is opened
+        // from the one just opened, so only levels above it can be dropped.
+        const size_t keep_open = budget() - 1;
+        if (stack_.size() > keep_open) stack_[stack_.size() - 1 - keep_open].second.close();
     }
     return &stack_.back().second;
 }

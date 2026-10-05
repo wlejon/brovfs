@@ -77,6 +77,8 @@ public:
             case Errc::cancelled: return "cancelled";
             case Errc::invalid_argument: return "invalid argument";
             case Errc::directory_not_empty_after_move: return "source directory gained entries during the move; it was kept";
+            case Errc::not_reversible: return "cannot be undone: the data it replaced is gone";
+            case Errc::target_changed: return "changed since the operation; left as it is";
         }
         return "unknown brovfs error";
     }

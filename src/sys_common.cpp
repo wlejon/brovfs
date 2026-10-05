@@ -7,6 +7,17 @@
 namespace bro::vfs::sys {
 
 std::atomic<bool> g_force_cross_device{false};
+std::atomic<int> g_open_dirs{0};
+std::atomic<int> g_open_dirs_peak{0};
+
+void count_dir_open() noexcept {
+    int now = g_open_dirs.fetch_add(1, std::memory_order_relaxed) + 1;
+    int peak = g_open_dirs_peak.load(std::memory_order_relaxed);
+    while (now > peak && !g_open_dirs_peak.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+    }
+}
+
+void count_dir_close() noexcept { g_open_dirs.fetch_sub(1, std::memory_order_relaxed); }
 
 bool exists_nofollow(const fs::path& p) {
     Stat st;

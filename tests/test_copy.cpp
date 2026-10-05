@@ -8,8 +8,36 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #endif
+#ifdef __linux__
+#include <fcntl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 using namespace t;
+
+#ifdef __linux__
+// 1 if every extent of `p` is shared (FIEMAP_EXTENT_SHARED), 0 if none is, -1 if mixed or
+// unknown.
+static int extents_shared(const fs::path& p) {
+    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    std::vector<char> buf(sizeof(struct fiemap) + 256 * sizeof(struct fiemap_extent));
+    auto* fm = reinterpret_cast<struct fiemap*>(buf.data());
+    fm->fm_start = 0;
+    fm->fm_length = FIEMAP_MAX_OFFSET;
+    fm->fm_flags = FIEMAP_FLAG_SYNC;
+    fm->fm_extent_count = 256;
+    int r = ::ioctl(fd, FS_IOC_FIEMAP, fm);
+    ::close(fd);
+    if (r != 0 || fm->fm_mapped_extents == 0) return -1;
+    unsigned shared = 0;
+    for (unsigned i = 0; i < fm->fm_mapped_extents; ++i) shared += (fm->fm_extents[i].fe_flags & FIEMAP_EXTENT_SHARED) != 0;
+    return shared == fm->fm_mapped_extents ? 1 : shared == 0 ? 0 : -1;
+}
+#endif
 
 static size_t temps_left(const fs::path& root) {
     size_t n = 0;
@@ -377,6 +405,31 @@ static void test_clone(const Scratch& s) {
     }
 #ifdef __APPLE__
     CHECK_MSG(cow, "APFS scratch expected to support clonefile");
+#endif
+#ifdef __linux__
+    // Independent oracle: the kernel's extent map. A reported reflink shares every extent with
+    // the source; a stream copy on a CoW file system shares none.
+    if (c.method == vfs::CopyMethod::Reflink) {
+        CHECK_MSG(extents_shared(s / "clone" / "dst.bin") == 1, "FIEMAP: reflinked copy has unshared extents");
+    }
+    if (cow) {
+        vfs::FileOpOptions plain;
+        plain.allow_reflink = false;
+        plain.allow_kernel_copy = false;
+        auto pr = vfs::copy_to(src, s / "clone" / "streamed.bin", plain);
+        CHECK(pr.ok() && pr.reflinked == 0 && pr.kernel_copied == 0);
+        ::sync();
+        CHECK_MSG(extents_shared(s / "clone" / "streamed.bin") == 0, "FIEMAP: a streamed copy shares extents");
+        // copy_file_range would itself clone on btrfs / XFS; with reflinks disallowed the
+        // copy must be physical whatever the method.
+        vfs::FileOpOptions kc;
+        kc.allow_reflink = false;
+        auto kr = vfs::copy_to(src, s / "clone" / "kernel.bin", kc);
+        CHECK(kr.ok() && kr.reflinked == 0);
+        ::sync();
+        CHECK_MSG(extents_shared(s / "clone" / "kernel.bin") == 0, "FIEMAP: reflinks disallowed but extents shared");
+        CHECK(same_content(src, s / "clone" / "kernel.bin"));
+    }
 #endif
     if (cow && strict.ok()) {
         // A clone shares blocks, not identity: writing it leaves the source untouched.

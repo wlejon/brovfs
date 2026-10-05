@@ -11,6 +11,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND MSVC)
 endif()
 
 set(BROVFS_SOURCES
+    src/aggregate.cpp
+    src/collate.cpp
+    src/dir_model.cpp
+    src/dir_model_view.cpp
+    src/ds_store.cpp
     src/file_ops.cpp
     src/mime.cpp
     src/path.cpp
@@ -18,10 +23,12 @@ set(BROVFS_SOURCES
     src/scanner.cpp
     src/staging.cpp
     src/sys_common.cpp
+    src/undo.cpp
     src/transfer.cpp
     src/trash_common.cpp
     src/types.cpp
     src/version.cpp
+    src/volume_monitor.cpp
     src/volumes.cpp
     src/walk.cpp
     src/watch_core.cpp
@@ -34,6 +41,7 @@ if(WIN32)
         src/sys_win_copy.cpp
         src/sys_win_meta.cpp
         src/trash_recycle_bin.cpp
+        src/volume_monitor_win.cpp
         src/volumes_win.cpp
         src/watcher_win.cpp
     )
@@ -46,7 +54,8 @@ else()
     )
     if(APPLE)
         enable_language(OBJCXX)
-        list(APPEND BROVFS_SOURCES src/watcher_fsevents.cpp src/trash_macos.cpp src/trash_macos_ns.mm)
+        list(APPEND BROVFS_SOURCES src/watcher_fsevents.cpp src/trash_macos.cpp src/trash_macos_ns.mm
+             src/volume_monitor_mac.cpp)
         set_source_files_properties(src/trash_macos_ns.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     else()
         list(APPEND BROVFS_SOURCES src/watcher_inotify.cpp)
@@ -74,12 +83,13 @@ if(WIN32)
     # Windows 10 1809+ APIs (FileDispositionInfoEx with IGNORE_READONLY, FileIdExtdDirectoryInfo);
     # each has a runtime fallback.
     target_compile_definitions(brovfs PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000006 UNICODE _UNICODE)
-    target_link_libraries(brovfs PUBLIC shell32 ole32 advapi32)
+    target_link_libraries(brovfs PUBLIC shell32 ole32 advapi32 user32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(brovfs PUBLIC Threads::Threads)
     if(APPLE)
-        target_link_libraries(brovfs PUBLIC "-framework CoreServices" "-framework Foundation")
+        target_link_libraries(brovfs PUBLIC "-framework CoreServices" "-framework Foundation"
+                              "-framework DiskArbitration")
     endif()
 endif()
 

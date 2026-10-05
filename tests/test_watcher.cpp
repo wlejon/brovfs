@@ -12,6 +12,13 @@
 #include <set>
 #include <thread>
 
+#ifdef __linux__
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 using namespace t;
 using K = vfs::WatchEventKind;
 
@@ -470,10 +477,145 @@ void test_overlap_and_remove(const Scratch& s) {
     CHECK(f.w.add(root / "plain.txt", vfs::WatchOptions(), ec) == 0 && ec);
 }
 
+#ifdef _WIN32
+std::wstring short_path(const fs::path& p) {
+    std::wstring w = p.native();
+    DWORD n = GetShortPathNameW(w.c_str(), nullptr, 0);
+    std::wstring out(n, L'\0');
+    n = n ? GetShortPathNameW(w.c_str(), out.data(), n) : 0;
+    out.resize(n);
+    return out;
+}
+
+// Changes made through 8.3 aliases are reported under long names. Needs a volume that
+// generates short names (the system temp volume usually does; the scratch volume may not).
+void test_short_names() {
+    section("Windows: changes through 8.3 short names are reported with long names");
+    fs::path base = other_volume_base(scratch_base());
+    std::error_code ec;
+    if (base.empty()) base = fs::temp_directory_path(ec) / "brovfs-scratch2";
+    Scratch s("watch83", base);
+    fs::path root = s / "w";
+    fs::create_directories(root / "long directory name");
+    write_file(root / "long directory name" / "long file name.txt", "x");
+    std::wstring sdir = short_path(root / "long directory name");
+    std::wstring sfile = short_path(root / "long directory name" / "long file name.txt");
+    if (sdir.empty() || fs::path(sdir).filename() == L"long directory name" ||
+        fs::path(sfile).filename() == L"long file name.txt") {
+        note("no 8.3 names generated on " + u8(base) + "; skipped");
+        return;
+    }
+    Feed f;
+    watch(f, root);
+    const fs::path ldir = root / "long directory name";
+    // Modify through the short file name inside the short directory name.
+    {
+        std::ofstream out(fs::path(sfile), std::ios::binary | std::ios::app);
+        out << "more";
+    }
+    CHECK(f.until(is(K::Modified, ldir / "long file name.txt")));
+    // Create through the short directory name.
+    write_file(fs::path(sdir) / "new.txt", "n");
+    CHECK(f.until(is(K::Created, ldir / "new.txt")));
+    // Delete through the short file name: the name can no longer be resolved, so its
+    // directory is rescanned (never a Removed naming the alias).
+    CHECK(DeleteFileW(sfile.c_str()));
+    CHECK(f.until([&](const vfs::WatchEvent& e) {
+        return (e.kind == K::Removed && e.path == ldir / "long file name.txt") || (e.kind == K::Rescan && e.path == ldir);
+    }));
+    // Rename through the short name of the directory.
+    CHECK(MoveFileW((fs::path(sdir) / "new.txt").c_str(), (fs::path(sdir) / "renamed file.txt").c_str()));
+    CHECK(f.until([&](const vfs::WatchEvent& e) {
+        return e.kind == K::Renamed && e.path == ldir / "renamed file.txt" && e.old_path == ldir / "new.txt";
+    }));
+    f.quiesce(300, 5000);
+    bool alias = false;
+    for (auto& e : f.events) {
+        for (const fs::path* p : {&e.path, &e.old_path}) {
+            for (const auto& c : p->lexically_relative(root)) {
+                if (c.native().find(L'~') != std::wstring::npos) alias = true;
+            }
+        }
+    }
+    CHECK_MSG(!alias, "an event named an 8.3 alias");
+}
+#endif
+
+#ifdef __linux__
+bool write_proc(const char* file, const std::string& text) {
+    int fd = ::open(file, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    ::close(fd);
+    return ok;
+}
+
+// The inotify watch limit, for real: a child process in its own user namespace lowers
+// user.max_inotify_watches (a per-namespace limit, nothing outside the child is affected) and
+// watches a tree with more directories than that. Directories beyond the limit are Error
+// events with ENOSPC naming them; everything that was watched still reports.
+int watch_limit_child(const fs::path& base) {
+    uid_t uid = ::getuid();
+    gid_t gid = ::getgid();
+    if (::unshare(CLONE_NEWUSER) != 0) return 77;
+    write_proc("/proc/self/setgroups", "deny");
+    if (!write_proc("/proc/self/uid_map", "0 " + std::to_string(uid) + " 1") ||
+        !write_proc("/proc/self/gid_map", "0 " + std::to_string(gid) + " 1") ||
+        !write_proc("/proc/sys/user/max_inotify_watches", "5")) {
+        return 77;
+    }
+    g_checks = g_failures = 0;
+    fs::path root = base / "limit";
+    for (int i = 0; i < 12; ++i) fs::create_directories(root / ("d" + std::to_string(i)) / "inner");
+    Feed f;
+    watch(f, root);
+    f.quiesce(300, 5000);
+    std::set<std::string> unwatched;
+    for (auto& e : f.events) {
+        if (e.kind == K::Error) {
+            CHECK_MSG(e.error == std::errc::no_space_on_device, e.error.message());
+            unwatched.insert(rel_of(e.path, root));
+        }
+    }
+    // Root + 4 directories fit; every other top-level directory is reported (its "inner"
+    // is not descended separately: it could not be watched either).
+    CHECK_MSG(unwatched.size() >= 7 && unwatched.size() <= 12, std::to_string(unwatched.size()));
+    for (auto& u : unwatched) CHECK_MSG(u.find('/') == std::string::npos || u.rfind("/inner") != std::string::npos, u);
+    // A change in a watched directory (the root) still arrives.
+    write_file(root / "after.txt", "a");
+    CHECK(f.until(is(K::Created, root / "after.txt")));
+    return g_failures == 0 ? 0 : 1;
+}
+
+void test_watch_limit(const Scratch& s) {
+    section("Linux: inotify watch limit (ENOSPC) becomes Error events naming the unwatched directories");
+    std::cout << std::flush;
+    pid_t pid = ::fork();
+    if (pid == 0) ::_exit(watch_limit_child(s.root()));
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+    if (code == 77) {
+        note("unprivileged user namespaces unavailable; skipped");
+        return;
+    }
+    CHECK_MSG(code == 0, "child exit " + std::to_string(code));
+}
+#endif
+
 } // namespace
 
 int main() {
     std::cout << "backend: " << vfs::DirectoryWatcher::backend_name() << "\n";
+#ifdef __linux__
+    {
+        Scratch ls("watchlimit");
+        test_watch_limit(ls); // forks before this process starts any thread
+    }
+#endif
+#ifdef _WIN32
+    test_short_names();
+#endif
     Scratch s("watch");
     test_basic(s);
     test_non_recursive(s);

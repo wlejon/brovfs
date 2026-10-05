@@ -1,12 +1,15 @@
 // Windows metadata that CopyFile2 does not carry: security descriptors (DACL, and owner/group
-// where the process may set them) and alternate data streams of directories.
+// where the process may set them), and alternate data streams and extended attributes of
+// directories.
 #ifdef _WIN32
 
 #include "src/win_util.h"
 
 #include <aclapi.h>
 #include <sddl.h>
+#include <winternl.h>
 
+#include <cstring>
 #include <vector>
 
 namespace bro::vfs::win {
@@ -133,6 +136,77 @@ void copy_streams(const fs::path& src, const fs::path& dst, std::vector<ItemErro
         }
     } while (FindNextStreamW(f, &fsd));
     FindClose(f);
+}
+
+namespace {
+
+using NtQueryEaFileFn = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, BOOLEAN, PVOID, ULONG, PULONG, BOOLEAN);
+using NtSetEaFileFn = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG);
+using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(NTSTATUS);
+
+struct EaApi {
+    NtQueryEaFileFn query = nullptr;
+    NtSetEaFileFn set = nullptr;
+    RtlNtStatusToDosErrorFn to_dos = nullptr;
+    EaApi() {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (!nt) return;
+        query = reinterpret_cast<NtQueryEaFileFn>(reinterpret_cast<void*>(GetProcAddress(nt, "NtQueryEaFile")));
+        set = reinterpret_cast<NtSetEaFileFn>(reinterpret_cast<void*>(GetProcAddress(nt, "NtSetEaFile")));
+        to_dos = reinterpret_cast<RtlNtStatusToDosErrorFn>(
+            reinterpret_cast<void*>(GetProcAddress(nt, "RtlNtStatusToDosError")));
+    }
+};
+
+constexpr NTSTATUS kNoEasOnFile = static_cast<NTSTATUS>(0xC0000052L);
+constexpr NTSTATUS kEasNotSupported = static_cast<NTSTATUS>(0xC000004FL);
+constexpr NTSTATUS kNoMoreEas = static_cast<NTSTATUS>(0x80000012L);
+
+} // namespace
+
+void copy_eas(const fs::path& src, const fs::path& dst, std::vector<ItemError>* warnings) {
+    static const EaApi api;
+    if (!api.query || !api.set || !api.to_dos) return;
+    Handle hs = open_nofollow(src, FILE_READ_EA);
+    if (!hs.ok()) {
+        DWORD e = GetLastError();
+        if (e != ERROR_ACCESS_DENIED) warn(warnings, dst, e, "read extended attributes");
+        return;
+    }
+    // One EA set is at most 64 KiB on NTFS; the buffer holds all of it in one query.
+    std::vector<unsigned char> buf(1u << 17);
+    IO_STATUS_BLOCK io{};
+    NTSTATUS st = api.query(hs.get(), &io, buf.data(), static_cast<ULONG>(buf.size()), FALSE, nullptr, 0, nullptr, TRUE);
+    if (st == kNoEasOnFile || st == kEasNotSupported || st == kNoMoreEas) return;
+    if (st < 0) {
+        warn(warnings, dst, api.to_dos(st), "read extended attributes");
+        return;
+    }
+    // The list's length: walk NextEntryOffset to the last entry.
+    size_t len = 0;
+    for (size_t off = 0;;) {
+        if (off + 8 > buf.size()) return;
+        ULONG next = 0;
+        std::memcpy(&next, buf.data() + off, sizeof(next));
+        const unsigned char name_len = buf[off + 5];
+        USHORT value_len = 0;
+        std::memcpy(&value_len, buf.data() + off + 6, sizeof(value_len));
+        size_t end = off + 8 + name_len + 1 + value_len;
+        if (next == 0) {
+            len = end;
+            break;
+        }
+        off += next;
+    }
+    if (len == 0 || len > buf.size()) return;
+    Handle hd = open_nofollow(dst, FILE_WRITE_EA);
+    if (!hd.ok()) {
+        warn(warnings, dst, GetLastError(), "write extended attributes");
+        return;
+    }
+    io = IO_STATUS_BLOCK{};
+    st = api.set(hd.get(), &io, buf.data(), static_cast<ULONG>(len));
+    if (st < 0) warn(warnings, dst, api.to_dos(st), "write extended attributes");
 }
 
 bool set_birth_time(const fs::path& dst, int64_t btime_ns, std::error_code& ec) {

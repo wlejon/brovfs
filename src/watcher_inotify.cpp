@@ -178,25 +178,36 @@ private:
 
     // Watch `rel` (a directory) and, recursively, every directory below it. Watch first, list
     // second: anything created after the listing is reported by the new watch.
-    void watch_tree(Root& r, const fs::path& rel) {
-        int wd = ::inotify_add_watch(r.fd, r.sys_path(rel).c_str(), kMask);
-        if (wd < 0) {
-            int e = errno;
-            if (e != ENOENT && e != ENOTDIR && e != ELOOP) push_error(r, rel, errno_ec(e));
-            return;
-        }
-        map(r, wd, rel);
-        watch_children(r, rel);
-    }
+    // Iterative (a deep tree must not exhaust the thread's stack). A directory that cannot be
+    // watched (ENOSPC once fs.inotify.max_user_watches is reached) is one Error naming it, and
+    // its subtree is not descended: none of it could be watched either.
+    void watch_tree(Root& r, const fs::path& rel) { watch_from(r, {rel}); }
 
-    void watch_children(Root& r, const fs::path& rel) {
+    void watch_children(Root& r, const fs::path& rel) { watch_from(r, list_subdirs(r, rel)); }
+
+    std::vector<fs::path> list_subdirs(Root& r, const fs::path& rel) {
         std::vector<fs::path> subdirs;
         std::error_code ec;
         sys::list_dir(r.sys_path(rel), [&](sys::RawEntry&& e) {
             if (e.st.kind == FileKind::Directory) subdirs.push_back(rel.empty() ? e.name : rel / e.name);
             return true;
         }, ec);
-        for (auto& d : subdirs) watch_tree(r, d);
+        return subdirs;
+    }
+
+    void watch_from(Root& r, std::vector<fs::path> pending) {
+        while (!pending.empty()) {
+            fs::path rel = std::move(pending.back());
+            pending.pop_back();
+            int wd = ::inotify_add_watch(r.fd, r.sys_path(rel).c_str(), kMask);
+            if (wd < 0) {
+                int e = errno;
+                if (e != ENOENT && e != ENOTDIR && e != ELOOP) push_error(r, rel, errno_ec(e));
+                continue;
+            }
+            map(r, wd, rel);
+            for (auto& d : list_subdirs(r, rel)) pending.push_back(std::move(d));
+        }
     }
 
     // After an overflow: rebuild the table from the tree as it is now.

@@ -59,9 +59,11 @@ struct Held {
 struct Watch {
     WatchId id = 0;
     fs::path root;
+    fs::path real;         // root with links resolved: where short names are looked up
     WatchOptions options;
     FileId root_id;
     bool extended = true;
+    bool old_unresolved = false; // a RENAMED_OLD_NAME became a Rescan: its NEW_NAME is a Created
     bool dead = false;     // RootRemoved pushed or being removed: push nothing more
     std::wstring leaf;     // root's name in its parent
     Request main;
@@ -69,6 +71,55 @@ struct Watch {
     std::optional<Held> held;
     std::promise<void>* on_gone = nullptr; // removal waiting for outstanding reads
 };
+
+// Could `c` be an 8.3 short name ("LONGFI~1.TXT")? Short names are upper case, a base of at
+// most 8 characters containing "~<digit>", and an extension of at most 3.
+bool short_name_shape(std::wstring_view c) {
+    size_t dot = c.rfind(L'.');
+    std::wstring_view base = dot == std::wstring_view::npos ? c : c.substr(0, dot);
+    std::wstring_view ext = dot == std::wstring_view::npos ? std::wstring_view() : c.substr(dot + 1);
+    if (base.empty() || base.size() > 8 || ext.size() > 3 || (dot != std::wstring_view::npos && ext.empty())) return false;
+    size_t t = base.find(L'~');
+    if (t == std::wstring_view::npos || t + 1 >= base.size() || base[t + 1] < L'0' || base[t + 1] > L'9') return false;
+    for (wchar_t ch : c) {
+        if (ch >= L'a' && ch <= L'z') return false;
+    }
+    return true;
+}
+
+// The long spelling of `rel` (relative to the directory `real`): each component that looks
+// like a short name is replaced by the name of the object it reaches. Returns false when such
+// a component no longer resolves (the object is gone); `resolved_prefix` then holds the
+// components before it, long-spelled.
+bool long_relative(const fs::path& real, const std::wstring& rel, fs::path& out, fs::path& resolved_prefix) {
+    out.clear();
+    fs::path rp(rel);
+    bool any = false;
+    for (const auto& c : rp) {
+        if (short_name_shape(c.native())) any = true;
+    }
+    if (!any) {
+        out = rp;
+        return true;
+    }
+    for (const auto& c : rp) {
+        if (!short_name_shape(c.native())) {
+            out /= c;
+            continue;
+        }
+        std::wstring full = win_extended_path(real / out / c);
+        DWORD need = GetLongPathNameW(full.c_str(), nullptr, 0);
+        std::wstring buf(need, L'\0');
+        DWORD got = need ? GetLongPathNameW(full.c_str(), buf.data(), need) : 0;
+        if (got == 0 || got >= need) {
+            resolved_prefix = out;
+            return false;
+        }
+        buf.resize(got);
+        out /= fs::path(buf).filename();
+    }
+    return true;
+}
 
 FileKind kind_of(DWORD attrs, DWORD tag) {
     bool link_dir = false;
@@ -181,6 +232,7 @@ private:
         auto w = std::make_unique<Watch>();
         w->id = id;
         w->root = root;
+        w->real = real;
         w->options = options;
         w->main.owner = w.get();
         w->parent.owner = w.get();
@@ -315,7 +367,23 @@ private:
                 name = r->FileName;
             }
             if (reinterpret_cast<const unsigned char*>(name) + name_len > data.data() + data.size()) break;
-            fs::path path = w.root / fs::path(std::wstring(name, name_len / sizeof(WCHAR)));
+            // Changes made through an 8.3 alias are reported under the short name; events always
+            // carry long names. A short name that no longer resolves (deleted, or the old name
+            // of a rename) cannot be translated: its directory is rescanned instead.
+            fs::path rel, prefix;
+            if (!long_relative(w.real, std::wstring(name, name_len / sizeof(WCHAR)), rel, prefix)) {
+                release_held(w);
+                sink_.rescan(w.id, prefix.empty() ? w.root : w.root / prefix);
+                w.old_unresolved = action == FILE_ACTION_RENAMED_OLD_NAME;
+                if (next == 0) break;
+                off += next;
+                continue;
+            }
+            if (w.old_unresolved) {
+                w.old_unresolved = false;
+                if (action == FILE_ACTION_RENAMED_NEW_NAME) action = FILE_ACTION_ADDED;
+            }
+            fs::path path = w.root / rel;
             FileKind fk = kind_of(attrs, tag);
             // A move to another directory of the tree is reported as REMOVED + ADDED; the
             // extended records carry the file id, which pairs them into a rename.

@@ -250,7 +250,22 @@ CopyMethod copy_file_data(const fs::path& src, const Stat& src_st, const fs::pat
     }
 #endif
 #ifdef __linux__
-    if (method == CopyMethod::None && hooks.allow_kernel_copy) {
+    // copy_file_range within one file system goes through the same remap operation as FICLONE
+    // and silently shares extents on btrfs / XFS. A caller that disallowed reflinks gets a
+    // physical copy: if this file system can clone (probed with FICLONE, undone at once),
+    // copy_file_range is skipped. With reflinks allowed, FICLONE already failed above, so
+    // copy_file_range cannot clone either and "KernelCopy" is exact.
+    bool fs_clones = false;
+#ifdef FICLONE
+    if (method == CopyMethod::None && hooks.allow_kernel_copy && !hooks.allow_reflink) {
+        struct stat os;
+        if (::fstat(out.get(), &os) == 0 && os.st_dev == ins.st_dev && ::ioctl(out.get(), FICLONE, in.get()) == 0) {
+            fs_clones = true;
+            if (::ftruncate(out.get(), 0) != 0) return fail(errno_ec(errno));
+        }
+    }
+#endif
+    if (method == CopyMethod::None && hooks.allow_kernel_copy && !fs_clones) {
         bool fallback = false;
         for (;;) {
             ssize_t r = ::copy_file_range(in.get(), nullptr, out.get(), nullptr, 8u << 20, 0);
