@@ -16,6 +16,8 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+
+#include "src/trash_macos.h"
 extern char** environ;
 static const char* g_argv0 = "";
 #endif
@@ -440,8 +442,10 @@ static void macos_finder_records(const Scratch& s) {
     run("hdiutil detach -quiet -force '" + mnt.native() + "'");
 }
 
-// Asking Finder to trash needs Automation consent, which a test (often over ssh) cannot give.
-// Require refuses without touching the item; IfPermitted falls back to NSFileManager.
+// Asking Finder to trash needs Automation consent, which a test (often over ssh) cannot give,
+// and even with consent Finder can fail the event (a CI runner's Finder does). Require then
+// fails without touching the item, with operation_not_permitted when consent is what is
+// missing; IfPermitted falls back to NSFileManager either way.
 static void macos_finder_mode(vfs::Trash& plain, const Scratch& s, const std::string& tag, const fs::path& journal) {
     section("macOS: trashing through Finder only with the user's Automation consent");
     vfs::MacTrashConfig req;
@@ -459,8 +463,10 @@ static void macos_finder_mode(vfs::Trash& plain, const Scratch& s, const std::st
         CHECK(!path_exists(f) && path_exists(fs::path(id)));
         CHECK_MSG(finder->restore(id, vfs::RestoreConflict::Fail, nullptr, ec) && read_file(f) == "f", ec.message());
     } else {
-        note("no Automation consent for Finder: " + ec.message());
-        CHECK(ec == std::errc::operation_not_permitted && read_file(f) == "f");
+        const int consent = vfs::detail::finder_permission(false);
+        note("Finder did not trash it (consent check: " + std::to_string(consent) + "): " + ec.message());
+        CHECK(read_file(f) == "f");
+        if (consent != 0) CHECK(ec == std::errc::operation_not_permitted);
         char buf[8];
         CHECK(::getxattr(f.c_str(), "com.bro.vfs.putback", buf, sizeof(buf), 0, XATTR_NOFOLLOW) < 0);
     }

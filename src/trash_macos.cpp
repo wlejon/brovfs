@@ -124,6 +124,19 @@ public:
         if (!predicted.empty()) journal_add(predicted);
         fs::path stored;
         bool moved = via_finder ? detail::finder_trash_item(p, stored, ec) : detail::ns_trash_item(p, stored, ec);
+        if (!moved && via_finder && cfg_.finder == FinderTrash::IfPermitted) {
+            // Consent is not the whole story: Finder can still refuse or fail the event (no
+            // GUI session, Finder busy or not running). IfPermitted promises the item reaches
+            // the trash either way, so when it is provably still here, untouched, move it the
+            // plain way instead.
+            sys::Stat now;
+            std::error_code sec;
+            if (sys::lstat(p, now, sec) && now.id == st.id) {
+                stored.clear();
+                ec.clear();
+                moved = detail::ns_trash_item(p, stored, ec);
+            }
+        }
         if (!moved) {
             rm_x(p);
             return false;
