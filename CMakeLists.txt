@@ -10,6 +10,18 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Coverage. Scoped to a top-level build: a consumer that add_subdirectory()s
+# brovfs has no business having its own build instrumented from in here.
+option(BROVFS_COVERAGE "Instrument the build for gcov coverage (GCC/Clang)" OFF)
+if(BROVFS_COVERAGE AND PROJECT_IS_TOP_LEVEL)
+    if(MSVC)
+        message(FATAL_ERROR "BROVFS_COVERAGE requires GCC or Clang (gcov instrumentation); MSVC is unsupported.")
+    endif()
+    add_compile_options(--coverage -O0 -g)
+    add_link_options(--coverage)
+    message(STATUS "brovfs: coverage instrumentation ON (-O0)")
+endif()
+
 set(BROVFS_SOURCES
     src/aggregate.cpp
     src/collate.cpp

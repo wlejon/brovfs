@@ -1,5 +1,7 @@
 # brovfs
 
+[![CI](https://github.com/wlejon/brovfs/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brovfs/actions/workflows/ci.yml)
+
 File-operations substrate for a desktop file manager: scanning, copy/move/remove, trash,
 volumes and MIME sniffing. A standalone C++20 library with no dependencies beyond the OS
 (no bro, no bronze, no Qt/GLib), Windows, Linux and macOS.
@@ -93,6 +95,11 @@ The first duty is never to lose data:
 - `brovfs/vfs.h`: umbrella header.
 
 ## Building
+
+There is nothing to fetch: brovfs needs CMake 3.24+, a C++20 compiler (MSVC, GCC or
+Clang) and the OS. [broapps](https://github.com/wlejon/broapps) and
+[brothumb](https://github.com/wlejon/brothumb) build on it, resolving it as a checkout
+beside them (`../brovfs`) or as their `third_party/brovfs` submodule.
 
 ```bash
 # Windows (Visual Studio generator)
