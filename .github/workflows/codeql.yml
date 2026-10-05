@@ -38,8 +38,10 @@ jobs:
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
 
+      # Tests off: they build scratch paths from the environment and spawn tools
+      # on purpose, which is what the queries flag, and they are not shipped code.
       - name: Configure
-        run: cmake -S brovfs -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S brovfs -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBROVFS_BUILD_TESTS=OFF
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
