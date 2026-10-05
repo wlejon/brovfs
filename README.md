@@ -78,8 +78,18 @@ The first duty is never to lose data:
 - `brovfs/volumes.h`: mounted volumes, capacity, read-only state; `VolumeMonitor` for
   added / removed / changed volumes (WM_DEVICECHANGE, `/proc/self/mountinfo` POLLPRI,
   DiskArbitration, plus a backstop poll).
-- `brovfs/mime.h`: magic-byte MIME sniffing (images, audio, video, documents,
-  archives, fonts, glTF/glb, ...).
+- `brovfs/mime.h`: the one place sibling libraries ask "what type is this file". Magic-byte
+  sniffing (images, audio, video, documents, archives, fonts, glTF/glb, Netpbm, ...) and
+  `MimeDatabase`: `system()` is the platform's own type database (shared-mime-info from
+  the XDG data dirs on Linux, UTType on macOS, the registry via `AssocQueryString` on
+  Windows) with the built-in table behind it for anything it does not know; `built_in()` is
+  the deterministic table alone, which is also the test oracle. Name lookups (`globs2`
+  weights, literal and wildcard globs, case-sensitive globs), aliases and `is_a`
+  (subclasses, plus `text/*` is `text/plain`, `+xml`/`+json`/`+zip` suffixes, everything
+  but `inode/*` is `application/octet-stream`). `type_for_file` / `type_for_data`
+  reconcile content and name: a weak sniff lets the name decide, a name that agrees with
+  (or refines) the content wins, otherwise the content does, and `FileType::basis` says
+  which.
 - `brovfs/vfs.h`: umbrella header.
 
 ## Building

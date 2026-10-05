@@ -18,6 +18,9 @@ set(BROVFS_SOURCES
     src/ds_store.cpp
     src/file_ops.cpp
     src/mime.cpp
+    src/mime_builtin.cpp
+    src/mime_db.cpp
+    src/mime_smi.cpp
     src/path.cpp
     src/remove.cpp
     src/scanner.cpp
@@ -37,6 +40,7 @@ set(BROVFS_SOURCES
 
 if(WIN32)
     list(APPEND BROVFS_SOURCES
+        src/mime_win.cpp
         src/sys_win.cpp
         src/sys_win_copy.cpp
         src/sys_win_meta.cpp
@@ -54,7 +58,7 @@ else()
     )
     if(APPLE)
         enable_language(OBJCXX)
-        list(APPEND BROVFS_SOURCES src/watcher_fsevents.cpp src/trash_macos.cpp src/trash_macos_ns.mm
+        list(APPEND BROVFS_SOURCES src/mime_mac.cpp src/watcher_fsevents.cpp src/trash_macos.cpp src/trash_macos_ns.mm
              src/volume_monitor_mac.cpp)
         set_source_files_properties(src/trash_macos_ns.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     else()
@@ -83,7 +87,7 @@ if(WIN32)
     # Windows 10 1809+ APIs (FileDispositionInfoEx with IGNORE_READONLY, FileIdExtdDirectoryInfo);
     # each has a runtime fallback.
     target_compile_definitions(brovfs PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000006 UNICODE _UNICODE)
-    target_link_libraries(brovfs PUBLIC shell32 ole32 advapi32 user32)
+    target_link_libraries(brovfs PUBLIC shell32 ole32 advapi32 user32 shlwapi)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(brovfs PUBLIC Threads::Threads)
@@ -93,7 +97,7 @@ else()
     endif()
 endif()
 
-option(BROVFS_BUILD_TESTS "Build the brovfs test suite" ON)
+option(BROVFS_BUILD_TESTS "Build the brovfs test suite" ${PROJECT_IS_TOP_LEVEL})
 if(BROVFS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

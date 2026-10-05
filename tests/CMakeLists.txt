@@ -13,6 +13,7 @@ set(BROVFS_TESTS
     test_trash
     test_worker
     test_mime
+    test_mime_db
     test_volumes
     test_watcher
     test_metadata

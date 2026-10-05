@@ -1,9 +1,10 @@
+// Magic-byte sniffing and type categories. Name <-> type tables live in mime_db.cpp /
+// mime_builtin.cpp.
 #include "brovfs/mime.h"
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <fstream>
-#include <unordered_map>
 #include <vector>
 
 namespace bro::vfs {
@@ -127,6 +128,19 @@ std::string sniff_mime_type(std::span<const uint8_t> data) {
 
     // QOI: 71 6F 69 66 ("qoif")
     if (starts_with_str(data, "qoif")) return "image/qoi";
+
+    // Netpbm: "P1".."P6", whitespace, then a dimension or a comment.
+    if (data.size() >= 4 && data[0] == 'P' && data[1] >= '1' && data[1] <= '6' && std::isspace(data[2])) {
+        size_t i = 2;
+        while (i < data.size() && std::isspace(data[i])) i++;
+        if (i < data.size() && (std::isdigit(data[i]) || data[i] == '#')) {
+            switch (data[1]) {
+                case '1': case '4': return "image/x-portable-bitmap";
+                case '2': case '5': return "image/x-portable-graymap";
+                default: return "image/x-portable-pixmap";
+            }
+        }
+    }
 
     // 2. Audio & Video
     // WAV: RIFF....WAVE
@@ -355,7 +369,11 @@ std::string get_mime_category(std::string_view mime_type) {
     if (mime_type.starts_with("model/")) return "model";
 
     if (mime_type == "application/pdf" || mime_type == "application/rtf" ||
-        mime_type == "application/postscript" || mime_type == "application/epub+zip") {
+        mime_type == "application/postscript" || mime_type == "application/epub+zip" ||
+        mime_type == "application/msword" || mime_type == "application/vnd.ms-excel" ||
+        mime_type == "application/vnd.ms-powerpoint" ||
+        mime_type.starts_with("application/vnd.openxmlformats-officedocument.") ||
+        mime_type.starts_with("application/vnd.oasis.opendocument.")) {
         return "document";
     }
 
@@ -383,167 +401,6 @@ std::string get_mime_category(std::string_view mime_type) {
     }
 
     return "binary";
-}
-
-namespace {
-
-const std::unordered_map<std::string, std::string>& get_extension_map() {
-    static const std::unordered_map<std::string, std::string> ext_map = {
-        {"png", "image/png"},
-        {"jpg", "image/jpeg"},
-        {"jpeg", "image/jpeg"},
-        {"gif", "image/gif"},
-        {"webp", "image/webp"},
-        {"bmp", "image/bmp"},
-        {"tiff", "image/tiff"},
-        {"tif", "image/tiff"},
-        {"svg", "image/svg+xml"},
-        {"ico", "image/x-icon"},
-        {"avif", "image/avif"},
-        {"qoi", "image/qoi"},
-        {"mp3", "audio/mpeg"},
-        {"wav", "audio/wav"},
-        {"flac", "audio/flac"},
-        {"ogg", "audio/ogg"},
-        {"opus", "audio/opus"},
-        {"m4a", "audio/mp4"},
-        {"aac", "audio/aac"},
-        {"mid", "audio/midi"},
-        {"midi", "audio/midi"},
-        {"mp4", "video/mp4"},
-        {"mkv", "video/x-matroska"},
-        {"webm", "video/webm"},
-        {"avi", "video/x-msvideo"},
-        {"mov", "video/quicktime"},
-        {"flv", "video/x-flv"},
-        {"pdf", "application/pdf"},
-        {"epub", "application/epub+zip"},
-        {"rtf", "application/rtf"},
-        {"zip", "application/zip"},
-        {"7z", "application/x-7z-compressed"},
-        {"tar", "application/x-tar"},
-        {"gz", "application/gzip"},
-        {"zst", "application/zstd"},
-        {"bz2", "application/x-bzip2"},
-        {"xz", "application/x-xz"},
-        {"rar", "application/vnd.rar"},
-        {"exe", "application/vnd.microsoft.portable-executable"},
-        {"dll", "application/vnd.microsoft.portable-executable"},
-        {"elf", "application/x-elf"},
-        {"so", "application/x-elf"},
-        {"wasm", "application/wasm"},
-        {"json", "application/json"},
-        {"xml", "application/xml"},
-        {"html", "text/html"},
-        {"htm", "text/html"},
-        {"css", "text/css"},
-        {"js", "application/javascript"},
-        {"ts", "application/typescript"},
-        {"py", "text/x-python"},
-        {"sh", "application/x-shellscript"},
-        {"txt", "text/plain"},
-        {"md", "text/markdown"},
-        {"ttf", "font/ttf"},
-        {"otf", "font/otf"},
-        {"ttc", "font/collection"},
-        {"woff", "font/woff"},
-        {"woff2", "font/woff2"},
-        {"pfa", "font/x-type1"},
-        {"pfb", "font/x-type1"},
-        {"t1", "font/x-type1"},
-        {"glb", "model/gltf-binary"},
-        {"gltf", "model/gltf+json"}
-    };
-    return ext_map;
-}
-
-const std::unordered_map<std::string, std::string>& get_mime_to_ext_map() {
-    static const std::unordered_map<std::string, std::string> mime_map = {
-        {"image/png", "png"},
-        {"image/jpeg", "jpg"},
-        {"image/gif", "gif"},
-        {"image/webp", "webp"},
-        {"image/bmp", "bmp"},
-        {"image/tiff", "tiff"},
-        {"image/svg+xml", "svg"},
-        {"image/x-icon", "ico"},
-        {"image/avif", "avif"},
-        {"image/qoi", "qoi"},
-        {"audio/mpeg", "mp3"},
-        {"audio/wav", "wav"},
-        {"audio/flac", "flac"},
-        {"audio/ogg", "ogg"},
-        {"audio/opus", "opus"},
-        {"audio/mp4", "m4a"},
-        {"audio/aac", "aac"},
-        {"audio/midi", "mid"},
-        {"video/mp4", "mp4"},
-        {"video/x-matroska", "mkv"},
-        {"video/webm", "webm"},
-        {"video/x-msvideo", "avi"},
-        {"video/quicktime", "mov"},
-        {"video/x-flv", "flv"},
-        {"application/pdf", "pdf"},
-        {"application/epub+zip", "epub"},
-        {"application/rtf", "rtf"},
-        {"application/zip", "zip"},
-        {"application/x-7z-compressed", "7z"},
-        {"application/x-tar", "tar"},
-        {"application/gzip", "gz"},
-        {"application/zstd", "zst"},
-        {"application/x-bzip2", "bz2"},
-        {"application/x-xz", "xz"},
-        {"application/vnd.rar", "rar"},
-        {"application/vnd.microsoft.portable-executable", "exe"},
-        {"application/x-elf", "elf"},
-        {"application/wasm", "wasm"},
-        {"application/json", "json"},
-        {"application/xml", "xml"},
-        {"text/html", "html"},
-        {"text/css", "css"},
-        {"application/javascript", "js"},
-        {"application/typescript", "ts"},
-        {"text/x-python", "py"},
-        {"application/x-shellscript", "sh"},
-        {"text/plain", "txt"},
-        {"text/markdown", "md"},
-        {"font/ttf", "ttf"},
-        {"font/otf", "otf"},
-        {"font/collection", "ttc"},
-        {"font/woff", "woff"},
-        {"font/woff2", "woff2"},
-        {"font/x-type1", "pfb"},
-        {"model/gltf-binary", "glb"},
-        {"model/gltf+json", "gltf"}
-    };
-    return mime_map;
-}
-
-} // namespace
-
-std::string extension_to_mime(std::string_view ext) {
-    std::string clean_ext(ext);
-    if (!clean_ext.empty() && clean_ext[0] == '.') {
-        clean_ext = clean_ext.substr(1);
-    }
-    clean_ext = to_lower(clean_ext);
-
-    const auto& map = get_extension_map();
-    auto it = map.find(clean_ext);
-    if (it != map.end()) {
-        return it->second;
-    }
-    return "application/octet-stream";
-}
-
-std::string mime_to_extension(std::string_view mime_type) {
-    std::string clean_mime = to_lower(mime_type);
-    const auto& map = get_mime_to_ext_map();
-    auto it = map.find(clean_mime);
-    if (it != map.end()) {
-        return it->second;
-    }
-    return "bin";
 }
 
 } // namespace bro::vfs
