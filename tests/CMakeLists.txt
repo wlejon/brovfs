@@ -45,3 +45,54 @@ target_link_libraries(probe_mime_tool PRIVATE brovfs)
 if(MSVC)
     target_compile_options(probe_mime_tool PRIVATE /W4 /permissive- /utf-8)
 endif()
+
+if(BROVFS_ENABLE_API)
+    add_executable(brovfs_test_api
+        test_vfs_api.cpp
+    )
+    target_include_directories(brovfs_test_api PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
+        ${PROJECT_SOURCE_DIR}
+    )
+    target_link_libraries(brovfs_test_api PRIVATE
+        brovfs_api
+        brovfs
+        bronze_runtime_shared
+    )
+    if(MSVC)
+        target_compile_options(brovfs_test_api PRIVATE /W4 /permissive- /utf-8)
+        target_compile_definitions(brovfs_test_api PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+        add_custom_command(TARGET brovfs_test_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brovfs_test_api>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_LINKER_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brovfs_test_api>
+        )
+    else()
+        target_compile_options(brovfs_test_api PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    if(NOT BRASS_HOST_BACKEND)
+        message(STATUS "brovfs: brovfs_test_api not registered (brass has no code generator for this target)")
+    else()
+        add_test(NAME brovfs_test_api COMMAND brovfs_test_api)
+        set_tests_properties(brovfs_test_api PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+        add_test(NAME brovfs_test_api_gc_stress COMMAND brovfs_test_api)
+        set_tests_properties(brovfs_test_api_gc_stress PROPERTIES
+            TIMEOUT 120
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
+        )
+        if(WIN32)
+            set_tests_properties(brovfs_test_api PROPERTIES
+                ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brovfs_test_api>;$ENV{PATH}")
+            set_property(TEST brovfs_test_api_gc_stress APPEND PROPERTY
+                ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brovfs_test_api>;$ENV{PATH}")
+        endif()
+    endif()
+endif()
+
