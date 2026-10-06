@@ -110,7 +110,10 @@ else()
 endif()
 
 # --- Standalone Bronze JavaScript API ---
-option(BROVFS_ENABLE_API "Build Bronze JavaScript API" ON)
+# On by default only when brovfs is the top-level project. A library that
+# consumes brovfs (broapps, brothumb, ...) then never needs bronze for it;
+# bro forces BROVFS_ENABLE_API ON itself when it wants the binding.
+option(BROVFS_ENABLE_API "Build Bronze JavaScript API" ${PROJECT_IS_TOP_LEVEL})
 if(BROVFS_ENABLE_API)
     if(NOT TARGET bronze_runtime_shared)
         set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)

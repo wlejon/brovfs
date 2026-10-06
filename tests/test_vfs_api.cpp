@@ -11,6 +11,16 @@
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #define CHECK(cond)                                                            \
     do {                                                                       \
         if (!(cond)) {                                                         \
@@ -41,6 +51,18 @@ std::string readFile(const std::filesystem::path& p) {
     std::ifstream in(p, std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(in)),
                        std::istreambuf_iterator<char>());
+}
+
+// A path as the body of a single-quoted JS string literal. Windows paths are
+// full of backslashes ("C:\Users\...\Temp\brovfs_api_test_..."), which JS
+// would read as escapes (\b is a backspace), so they are escaped here.
+std::string jsPath(const std::filesystem::path& p) {
+    std::string out;
+    for (char c : p.string()) {
+        if (c == '\\' || c == '\'') out += '\\';
+        out += c;
+    }
+    return out;
 }
 
 bool pumpUntil(const std::function<bool()>& condition, int timeoutMs = 5000) {
@@ -125,8 +147,8 @@ int main() {
 
         std::string script =
             "(function() {\n"
-            "  const mTxt = bro.vfs.getMime('" + testFile.string() + "');\n"
-            "  const mJson = bro.vfs.getMime('" + jsonFile.string() + "');\n"
+            "  const mTxt = bro.vfs.getMime('" + jsPath(testFile) + "');\n"
+            "  const mJson = bro.vfs.getMime('" + jsPath(jsonFile) + "');\n"
             "  if (mTxt !== 'text/plain') return false;\n"
             "  if (mJson !== 'application/json') return false;\n"
             "  const vols = bro.vfs.listVolumes();\n"
@@ -149,12 +171,16 @@ int main() {
         writeFile(scanDir / "file2.txt", "22");
         writeFile(scanDir / "sub" / "file3.txt", "333");
         writeFile(scanDir / ".hidden.txt", "secret");
+#ifdef _WIN32
+        // A leading dot hides a file on POSIX only; Windows hides by attribute.
+        SetFileAttributesW((scanDir / ".hidden.txt").c_str(), FILE_ATTRIBUTE_HIDDEN);
+#endif
 
         std::string script =
             "(function() {\n"
             "  globalThis._scanDone = false;\n"
             "  globalThis._scanEntries = null;\n"
-            "  bro.vfs.scan('" + scanDir.string() + "', { recursive: true, includeHidden: true })\n"
+            "  bro.vfs.scan('" + jsPath(scanDir) + "', { recursive: true, includeHidden: true })\n"
             "    .then(entries => {\n"
             "      globalThis._scanDone = true;\n"
             "      globalThis._scanEntries = entries;\n"
@@ -176,24 +202,23 @@ int main() {
         auto checkRes = evalScript(
             "(function() {\n"
             "  const entries = globalThis._scanEntries;\n"
-            "  if (!Array.isArray(entries)) return false;\n"
-            "  if (entries.length !== 5) return false;\n" // file1, file2, sub, file3, .hidden
+            "  if (!Array.isArray(entries)) return 'no entries: ' + globalThis._scanError;\n"
             "  const names = entries.map(e => e.name);\n"
-            "  if (!names.includes('file1.txt')) return false;\n"
-            "  if (!names.includes('sub')) return false;\n"
-            "  if (!names.includes('file3.txt')) return false;\n"
-            "  if (!names.includes('.hidden.txt')) return false;\n"
+            "  if (entries.length !== 5) return 'expected 5 entries, got ' + names.join(',');\n" // file1, file2, sub, file3, .hidden
+            "  for (const n of ['file1.txt', 'sub', 'file3.txt', '.hidden.txt'])\n"
+            "    if (!names.includes(n)) return 'missing ' + n + ' in ' + names.join(',');\n"
             "  const f1 = entries.find(e => e.name === 'file1.txt');\n"
-            "  if (!f1 || !f1.isRegular || f1.size !== 1) return false;\n"
+            "  if (!f1.isRegular || f1.size !== 1) return 'file1.txt: ' + JSON.stringify(f1);\n"
             "  const sub = entries.find(e => e.name === 'sub');\n"
-            "  if (!sub || !sub.isDirectory) return false;\n"
+            "  if (!sub.isDirectory) return 'sub: ' + JSON.stringify(sub);\n"
             "  const hid = entries.find(e => e.name === '.hidden.txt');\n"
-            "  if (!hid || !hid.isHidden) return false;\n"
+            "  if (!hid.isHidden) return '.hidden.txt: ' + JSON.stringify(hid);\n"
             "  return true;\n"
             "})()\n"
         );
         CHECK(!checkRes.thrown);
-        CHECK(ev::isBool(checkRes.value) && ev::toBool(checkRes.value));
+        CHECK_MSG(ev::isBool(checkRes.value) && ev::toBool(checkRes.value),
+                  ev::isString(checkRes.value) ? ev::toUtf8(checkRes.value) : std::string("?"));
         std::cout << "  scan [PASS]" << std::endl;
     }
 
@@ -208,7 +233,7 @@ int main() {
             "(function() {\n"
             "  globalThis._copyDone = false;\n"
             "  globalThis._copyRes = null;\n"
-            "  bro.vfs.copy('" + srcFile.string() + "', '" + dstFile.string() + "')\n"
+            "  bro.vfs.copy('" + jsPath(srcFile) + "', '" + jsPath(dstFile) + "')\n"
             "    .then(res => {\n"
             "      globalThis._copyDone = true;\n"
             "      globalThis._copyRes = res;\n"
@@ -281,7 +306,7 @@ int main() {
         std::string script =
             "(function() {\n"
             "  globalThis._moveDone = false;\n"
-            "  bro.vfs.move('" + fileA.string() + "', '" + fileB.string() + "')\n"
+            "  bro.vfs.move('" + jsPath(fileA) + "', '" + jsPath(fileB) + "')\n"
             "    .then(res => {\n"
             "      globalThis._moveDone = true;\n"
             "      globalThis._moveRes = res;\n"
@@ -302,7 +327,7 @@ int main() {
         script =
             "(function() {\n"
             "  globalThis._rmDone = false;\n"
-            "  bro.vfs.remove('" + fileB.string() + "')\n"
+            "  bro.vfs.remove('" + jsPath(fileB) + "')\n"
             "    .then(res => {\n"
             "      globalThis._rmDone = true;\n"
             "    });\n"
@@ -329,7 +354,7 @@ int main() {
             "(function() {\n"
             "  globalThis._trashDone = false;\n"
             "  globalThis._trashEntry = null;\n"
-            "  bro.vfs.trash('" + fileToTrash.string() + "')\n"
+            "  bro.vfs.trash('" + jsPath(fileToTrash) + "')\n"
             "    .then(entry => {\n"
             "      globalThis._trashDone = true;\n"
             "      globalThis._trashEntry = entry;\n"
@@ -413,7 +438,7 @@ int main() {
         std::string script =
             "(function() {\n"
             "  globalThis._events = [];\n"
-            "  globalThis._watchHandle = bro.vfs.watch('" + watchDir.string() + "', (events) => {\n"
+            "  globalThis._watchHandle = bro.vfs.watch('" + jsPath(watchDir) + "', (events) => {\n"
             "    for (const e of events) globalThis._events.push(e);\n"
             "  }, { latency: 20 });\n"
             "  return (typeof globalThis._watchHandle === 'object' && typeof globalThis._watchHandle.unwatch === 'function');\n"
@@ -460,7 +485,7 @@ int main() {
 
         std::string script =
             "(function() {\n"
-            "  globalThis._model = new bro.vfs.DirectoryModel('" + modelDir.string() + "');\n"
+            "  globalThis._model = new bro.vfs.DirectoryModel('" + jsPath(modelDir) + "');\n"
             "  return (typeof globalThis._model.entries === 'function');\n"
             "})()\n";
         auto r = evalScript(script);

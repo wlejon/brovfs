@@ -19,8 +19,9 @@ concurrency:
 # .DS_Store parsers are the realistic bugs, and they are what the C++ queries
 # look for. The Linux backends are what this analyses.
 #
-# brovfs has no vendored or sibling code, so there is nothing to pre-build
-# outside the trace: every translation unit compiled below is ours.
+# brovfs has no vendored code; the only sibling code is bronze (and brass
+# through it) for brovfs_api, which is pre-built below ahead of `init` so it
+# stays out of the trace: every translation unit compiled while traced is ours.
 jobs:
   analyze:
     name: Analyze C++
@@ -35,6 +36,8 @@ jobs:
         with:
           path: brovfs
 
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
 
@@ -42,6 +45,11 @@ jobs:
       # on purpose, which is what the queries flag, and they are not shipped code.
       - name: Configure
         run: cmake -S brovfs -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBROVFS_BUILD_TESTS=OFF
+
+      # bronze/brass are analysed by their own workflows; anything built
+      # before `init` is never extracted.
+      - name: Pre-build bronze (outside the traced build)
+        run: cmake --build build --parallel 4 --target bronze_runtime_shared
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
