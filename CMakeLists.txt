@@ -6,8 +6,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The DLL CRT (/MD, /MDd), as bro uses. brovfs_api's tests link
+# bronze_runtime_shared, a DLL whose embed boundary passes C++ objects
+# (std::string, ...) both ways: with the static CRT the DLL and the test
+# executable each get their own heap, and a Debug build asserts
+# (__acrt_first_block == header) the first time one frees the other's memory.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 # Coverage. Scoped to a top-level build: a consumer that add_subdirectory()s
