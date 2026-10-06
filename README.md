@@ -1,127 +1,185 @@
 # brovfs
 
 [![CI](https://github.com/wlejon/brovfs/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brovfs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-File-operations substrate for a desktop file manager: scanning, copy/move/remove, trash,
-volumes and MIME sniffing. A standalone C++20 library with no dependencies beyond the OS
-(no bro, no bronze, no Qt/GLib), Windows, Linux and macOS.
+File-operations substrate for a desktop file manager: directory scanning, copy/move/remove,
+trash lifecycle, volume monitoring, file watching, and MIME sniffing. A standalone C++20
+library with no dependencies beyond the operating system (no bro, no bronze, no Qt or GLib),
+shipping native backends for Windows, Linux, and macOS.
+
+brovfs sits in the desktop-environment layer of the
+[bro ecosystem](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md). It is consumed
+directly by sibling desktop libraries such as [broapps](https://github.com/wlejon/broapps)
+(which relies on its MIME database and directory watcher) and
+[brothumb](https://github.com/wlejon/brothumb) (for file sniffing and cache locations).
+The [bro runtime](https://github.com/wlejon/bro) mounts its JavaScript binding
+(`brovfs_api` in `src/api/`) under the `BRO_WITH_VFS` build gate, exposing `bro.vfs` to
+apps running on the bronze JavaScript engine.
+
+## Safety Guarantees
 
 The first duty is never to lose data:
 
-- Every operation is planned against a scanned, no-follow model of the source and checked
-  by file identity (device + inode / volume serial + 128-bit file ID) before it acts.
-- Files are written to a temp sibling (`.brovfs-<hex>.tmp`), synced, and committed with a
-  no-replace rename (or replace, only when the caller chose Overwrite).
-- A move renames when it can. Only a cross-device error falls back to copy, and a source is
-  deleted only after its destination is committed and the source still matches the plan.
-  Source directories are removed with `rmdir` only.
-- Removal and traversal go through directory handles (`openat`/`fstatat`/`unlinkat` with
-  no-follow on POSIX; `NtCreateFile` relative to the parent handle and delete-by-handle on
-  Windows), each opened relative to its parent and identity-checked, so a parent swapped
-  for a link mid-operation cannot redirect a delete.
-- Metadata travels with a copy: times (and birth time where settable), mode, ownership
-  where permitted, xattrs, POSIX / extended ACLs or security descriptors when asked
-  (`preserve_acls`), Windows alternate data streams and attributes, and hard-link sets
-  within one operation. Crash leftovers (`.brovfs-<16 hex>.tmp`) can be found and cleaned
-  with `find_staging_leftovers` / `clean_staging_leftovers`.
-- Links are copied, moved and removed as links; deleting a junction or symlink never
+- **Pre-flight planning & file identity:** Every operation is planned against a scanned,
+  no-follow model of the source and verified by file identity (device + inode on POSIX;
+  volume serial + 128-bit file ID on Windows) before acting.
+- **Atomic staging:** Files are copied to a temp sibling (`.brovfs-<hex>.tmp`), flushed to
+  disk, and committed with an atomic no-replace rename (or replacement rename only when the
+  caller specifies `Overwrite`).
+- **Safe moves:** Same-device moves rename in place. Cross-device transfers fall back to
+  copy-then-delete; the source is unlinked only after the destination is fully committed and
+  the source still matches the pre-flight identity. Source directories are removed with
+  `rmdir` only.
+- **Race-resistant traversal:** Directory traversal and removal go through directory handles
+  (`openat`/`fstatat`/`unlinkat` with `O_NOFOLLOW` on POSIX; `NtCreateFile` relative to the
+  parent handle and delete-by-handle on Windows). A parent swapped for a symlink mid-operation
+  cannot redirect a deletion.
+- **Metadata preservation:** File timestamps (including birth time where supported),
+  permissions/mode, ownership where permitted, POSIX/extended ACLs or Windows security
+  descriptors (`preserve_acls`), Windows alternate data streams (ADS), and hard-link sets
+  within an operation are preserved. Staging leftovers can be swept with
+  `clean_staging_leftovers()`.
+- **Link safety:** Symlinks and junctions are manipulated as links; deleting a link never
   touches its target.
-- Conflicts are surfaced (`ConflictPolicy`, or a `ConflictResolver` callback with
-  `Ask`); same-file and type-mismatch overwrites are refused.
-- Results are per item: `OpResult` reports Success / Partial / Failed / Cancelled with
-  every error and warning.
+- **Structured results:** Operations report per-item status via `OpResult` (`Success`,
+  `Partial`, `Failed`, `Cancelled`), recording an audit trail in `OpResult::done` for undo.
 
-## Headers
+## Platforms
 
-- `brovfs/path.h`: UTF-8 (WTF-8 on Windows) path conversion, `\\?\` long paths.
-- `brovfs/scanner.h`: sync, streamed and async directory scans with per-entry errors
-  (getdents64 + statx on Linux; FileIdExtdDirectoryInfo on Windows).
-- `brovfs/file_ops.h`: `copy_into/to`, `move_into/to`, `remove`, `clone_file`
-  (FICLONE / APFS clonefile reflink, then copy_file_range, then streaming; the method used
-  is reported), staging-leftover cleanup. On btrfs / XFS, copy_file_range shares extents
-  just as FICLONE does, so `allow_reflink = false` probes for clone support and then
-  streams: false guarantees a physical copy on Linux (verified with FIEMAP). Windows
-  CopyFile2 may still block-clone on ReFS. Traversal keeps at most
-  `detail::g_dir_handle_budget` (32) directory handles open however deep the tree; a
-  dropped level is reopened by path and accepted only if its identity still matches.
-  `OpResult::done` lists what each operation did, for `undo.h`.
-- `brovfs/watcher.h`: `DirectoryWatcher`, recursive or not, value events (Created /
-  Removed / Modified / Renamed / Rescan / RootRemoved / Error) coalesced into a
-  `WatchEventQueue` the host drains on its own thread. ReadDirectoryChangesExW on Windows,
-  inotify with dynamic subdirectory watches and cookie rename pairing on Linux, FSEvents on
-  macOS. A lost kernel queue is a `Rescan` of the affected directory, never silence, so a
-  consumer applying the events to its model (rescanning on `Rescan`) always reconciles.
-  Windows 8.3 short names in events are reported as long names (a name that no longer
-  resolves becomes a `Rescan`); on Linux a directory over the inotify watch limit is an
-  `Error` event (ENOSPC) naming it, and the rest stays watched.
-- `brovfs/dir_model.h`: `DirectoryModel`, one directory as a sorted, filtered list kept
-  current by a scan plus a watcher: stable item keys (kept across renames), incremental
-  Remove / Insert / Update ops by index, generations, snapshots, `settle()`.
-- `brovfs/collate.h`: `natural_compare` / `NaturalLess` ("file2" before "file10",
-  case-folded, total order).
-- `brovfs/aggregate.h`: `aggregate_selection`, background size / count totals for a
-  selection, with progress and cancellation.
-- `brovfs/undo.h`: `UndoJournal` of copy / move / trash records made from
-  `OpResult::done`; undo and redo check every step against identity (id, birth time,
-  inode generation) and state first and refuse (`target_changed`, `not_reversible`,
-  `restore_target_exists`) with nothing changed; save / load as text.
-- `brovfs/event_queue.h`: the `MessageQueue<T>` the watcher delivers through.
-- `brovfs/worker.h`: `FileOpsWorker` background job queue with progress, pause, resume
-  and cancel.
-- `brovfs/trash.h`: freedesktop.org trash per spec (home trash, `$topdir/.Trash/$uid`,
-  `$topdir/.Trash-$uid`, directorysizes) and the Windows Recycle Bin (shell recycle that
-  refuses rather than permanently deleting; listing, restore and erase from `$I` records),
-  and the macOS Trash. On macOS, Finder's "Put Back" works only for items Finder itself
-  trashed (its records live in the trash's `.DS_Store`). `MacTrashConfig::finder` trashes
-  through Finder by Apple Event when the user has granted Automation consent, so Put Back
-  works for those items. Otherwise NSFileManager is used and restore data goes in xattrs on
-  the item. Items Finder trashed are listed and restored from its `.DS_Store` records,
-  which needs Full Disk Access for `~/.Trash`. See the header.
-- `brovfs/volumes.h`: mounted volumes, capacity, read-only state; `VolumeMonitor` for
-  added / removed / changed volumes (WM_DEVICECHANGE, `/proc/self/mountinfo` POLLPRI,
-  DiskArbitration, plus a backstop poll).
-- `brovfs/mime.h`: the one place sibling libraries ask "what type is this file". Magic-byte
-  sniffing (images, audio, video, documents, archives, fonts, glTF/glb, Netpbm, ...) and
-  `MimeDatabase`: `system()` is the platform's own type database (shared-mime-info from
-  the XDG data dirs on Linux, UTType on macOS, the registry via `AssocQueryString` on
-  Windows) with the built-in table behind it for anything it does not know; `built_in()` is
-  the deterministic table alone, which is also the test oracle. Name lookups (`globs2`
-  weights, literal and wildcard globs, case-sensitive globs), aliases and `is_a`
-  (subclasses, plus `text/*` is `text/plain`, `+xml`/`+json`/`+zip` suffixes, everything
-  but `inode/*` is `application/octet-stream`). `type_for_file` / `type_for_data`
-  reconcile content and name: a weak sniff lets the name decide, a name that agrees with
-  (or refines) the content wins, otherwise the content does, and `FileType::basis` says
-  which.
-- `brovfs/vfs.h`: umbrella header.
+All backends use native OS system calls directly without abstraction wrappers:
+
+| Platform | Verified Toolchain | File Operations & Scanning | File Watching | Trash System | Volumes & Types |
+|---|---|---|---|---|---|
+| **Windows** | MSVC 2022+ (x64) | `FileIdExtdDirectoryInfo` fast enumerations; `CopyFile2` / streaming; delete-by-handle via `NtCreateFile` | `ReadDirectoryChangesExW` with 8.3 short-name expansion | Windows Recycle Bin via Shell interfaces; listing, restore, and erase from `$I` records | `WM_DEVICECHANGE`, `GetVolumeInformationW`; Registry `AssocQueryString` MIME lookup |
+| **Linux** | GCC 12+, Clang 15+ (x86-64, aarch64) | `getdents64` + `statx`; `FICLONE` reflink, `copy_file_range` extent sharing, streaming fallback; `openat`/`unlinkat` | `inotify` with dynamic recursive sub-watches and cookie rename pairing | Freedesktop Trash specification (`~/.local/share/Trash`, `$topdir/.Trash-$uid`) | `/proc/self/mountinfo` polling (`POLLPRI`); XDG shared-mime-info database |
+| **macOS** | Apple Clang (Xcode 15+, arm64, x86-64) | APFS `clonefile` reflink; `openat`/`unlinkat` directory-relative operations | `FSEvents` API with event coalescing and path translation | `NSFileManager` trash; Finder Apple Events when Automation consent is granted; `.DS_Store` restore | `DiskArbitration` framework; Uniform Type Identifiers (`UTType`) |
+
+## Architecture & API Overview
+
+```
+include/brovfs/
+  vfs.h           Umbrella header
+  path.h          UTF-8 (WTF-8 on Windows) normalization and \\?\ long-path handling
+  types.h         FileIdentity, FileMetadata, DirEntry, OpResult, ConflictPolicy
+  scanner.h       Synchronous, streamed, and async directory scanners with per-entry errors
+  file_ops.h      copy_into/to, move_into/to, remove, clone_file, staging cleanup
+  watcher.h       DirectoryWatcher (recursive/flat) delivering to WatchEventQueue
+  dir_model.h     DirectoryModel: reactive sorted/filtered file lists with stable keys
+  collate.h       natural_compare / NaturalLess human-friendly collation
+  aggregate.h     aggregate_selection: background recursive size and entry counts
+  undo.h          UndoJournal: identity-validated undo/redo for copy, move, and trash
+  trash.h         Native trash operations: trash_items, list_trash, restore, erase
+  volumes.h       Mounted volumes, disk capacity, and VolumeMonitor hotplug listener
+  mime.h          Magic-byte sniffing, MimeDatabase (system + deterministic built-in), globs
+  worker.h        FileOpsWorker background queue with progress, pause, resume, and cancel
+  event_queue.h   Thread-safe MessageQueue<T>
+  api.h           Bronze JavaScript binding entry point (brovfs_api)
+```
+
+### Key Components
+
+- **Directory Scanning (`scanner.h`):** `scan_directory` delivers batches of `DirEntry` items
+  streamed or accumulated. Linux uses `getdents64` followed by `statx` only when extra
+  metadata is needed; Windows queries `FileIdExtdDirectoryInfo` to retrieve 128-bit file
+  identifiers in bulk.
+- **File Operations (`file_ops.h`):** High-level verbs handle recursive trees, preserve
+  attributes, and report progress. `clone_file` attempts hardware/filesystem clone
+  first (`FICLONE` on Linux btrfs/XFS, `clonefile` on macOS APFS) before falling back to
+  `copy_file_range` or buffered streaming.
+- **Directory Watching (`watcher.h`):** `DirectoryWatcher` emits `WatchEvent` notifications
+  (`Created`, `Removed`, `Modified`, `Renamed`, `Rescan`, `RootRemoved`, `Error`). A kernel
+  queue overflow produces a `Rescan` event rather than dropped events, guaranteeing the
+  consumer model reconciles.
+- **Reactive Model (`dir_model.h`):** `DirectoryModel` maintains an in-memory view of a
+  directory, applying watcher events incrementally (`Insert`, `Remove`, `Update`) with
+  deterministic sorting and filtering.
+- **MIME System (`mime.h`):** `MimeDatabase::system()` inspects magic signatures, XDG
+  `shared-mime-info` or OS registries, glob rules, and sub-class hierarchies (`is_a`), while
+  `MimeDatabase::built_in()` provides an offline deterministic oracle.
+- **Undo Journal (`undo.h`):** Records completed actions from `OpResult::done`. Reversals
+  verify file identity, timestamps, and destination availability before mutating the
+  filesystem.
 
 ## Building
 
-There is nothing to fetch: brovfs needs CMake 3.24+, a C++20 compiler (MSVC, GCC or
-Clang) and the OS. [broapps](https://github.com/wlejon/broapps) and
-[brothumb](https://github.com/wlejon/brothumb) build on it, resolving it as a checkout
-beside them (`../brovfs`) or as their `third_party/brovfs` submodule.
+brovfs requires CMake 3.24+ and a C++20 compiler. It has no mandatory external dependencies.
+
+### Standalone Build
 
 ```bash
-# Windows (Visual Studio generator)
+# Windows (Visual Studio 2022 or Ninja)
 cmake -B build -DBROVFS_BUILD_TESTS=ON
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
-# Linux
+# Linux (GCC / Clang + Ninja)
 cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROVFS_BUILD_TESTS=ON
-cmake --build build-release && ctest --test-dir build-release --output-on-failure
+cmake --build build-release
+ctest --test-dir build-release --output-on-failure
 
-# macOS (Foundation + CoreServices + DiskArbitration; one Objective-C++ file for the trash)
-cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DBROVFS_BUILD_TESTS=ON
-cmake --build build-release && ctest --test-dir build-release --output-on-failure
+# macOS (Apple Clang + Ninja)
+cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROVFS_BUILD_TESTS=ON
+cmake --build build-release
+ctest --test-dir build-release --output-on-failure
 ```
 
-The tests use the real file system, only inside scratch directories they create
-(`BROVFS_TEST_SCRATCH`, default `./brovfs-scratch`). Cross-device cases use
-`BROVFS_TEST_SCRATCH2` (default: `%TEMP%` on Windows, `/dev/shm` on Linux, when it is a
-different device). The Windows and macOS trash tests use the real Recycle Bin / Trash but
-touch only items they created themselves. On macOS a persistent journal in the scratch
-base records each item before it is trashed, so a crashed run's leftovers are erased by
-the next run (enumerating `~/.Trash` itself needs Full Disk Access). The volume tests
-create a `subst` drive (Windows), a bind mount in a private user + mount namespace (Linux)
-or an attached disk image (macOS), and remove it again.
+### Consuming brovfs as a Dependency
+
+Downstream consumers (such as [broapps](https://github.com/wlejon/broapps) and
+[brothumb](https://github.com/wlejon/brothumb)) resolve brovfs via CMake `add_subdirectory()`
+and link against `brovfs::brovfs`:
+
+```cmake
+add_subdirectory(path/to/brovfs)
+target_link_libraries(your_target PRIVATE brovfs::brovfs)
+```
+
+In accordance with the ecosystem dependency convention, consumers support two checkout
+layouts:
+
+1. **Sibling checkout (development default):**
+   Checked out alongside the consumer at `../brovfs` (can be overridden via `-DBROVFS_DIR=<path>`):
+   ```bash
+   git clone https://github.com/wlejon/broapps
+   git clone https://github.com/wlejon/brovfs    # Sibling directory
+   ```
+2. **Submodule layout (isolated / CI builds):**
+   Embedded as a git submodule inside `third_party/brovfs`:
+   ```bash
+   git clone --recursive https://github.com/wlejon/broapps
+   # or initialize in an existing checkout:
+   git submodule update --init --recursive
+   ```
+
+### Optional Bronze JavaScript API
+
+The standalone JavaScript binding (`BROVFS_ENABLE_API=ON`, default) compiles `brovfs_api`
+for the [bronze](https://github.com/wlejon/bronze) engine. It requires `../bronze` and
+`../brass` checked out beside this repository, or `-DBRONZE_DIR=<path>`. Set
+`-DBROVFS_ENABLE_API=OFF` for pure C++ builds without JavaScript support.
+
+## Tests
+
+The test suite runs real system operations against the OS filesystem (no mocks, no plain
+`assert()`). Failures count in all build configurations. When an optional OS capability is
+absent, tests exit with status `77` (ctest skip) and report the exact reason:
+
+- **Scoped Scratch Directories:** All file operations run within an isolated scratch root
+  configured via `BROVFS_TEST_SCRATCH` (defaults to `./brovfs-scratch`). Cross-device move
+  tests use `BROVFS_TEST_SCRATCH2` (`%TEMP%` on Windows, `/dev/shm` on Linux) to safely test
+  fallback copy-then-unlink logic across filesystem boundaries.
+- **Linux User & Mount Namespaces:** Volume monitoring tests (`test_volumes`) verify bind
+  mounts and read-only remounts by creating an isolated unprivileged user and mount namespace
+  (`unshare(CLONE_NEWUSER | CLONE_NEWNS)`). If the kernel restricts unprivileged user
+  namespaces (such as Ubuntu 24.04 AppArmor confinement via
+  `kernel.apparmor_restrict_unprivileged_userns`), the namespace test skips gracefully.
+- **macOS Full Disk Access (FDA):** Native trash testing uses `NSFileManager` and temporary
+  journals. Trashing via Finder automation or inspecting raw `~/.Trash` contents / `.DS_Store`
+  records requires Full Disk Access under macOS privacy controls. If FDA is not granted to
+  the test runner, tests that inspect `~/.Trash` directly skip while scoped scratch trash tests
+  continue to run.
+- **Windows Recycle Bin Isolation:** Shell Recycle Bin tests operate strictly on uniquely
+  named temporary items created by the test harness and clean them up during teardown.
+- **Coverage:** Linux GCC/Clang builds support `-DBROVFS_COVERAGE=ON` for branch coverage
+  reporting with `gcovr`.
