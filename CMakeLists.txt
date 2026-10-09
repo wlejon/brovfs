@@ -128,7 +128,7 @@ if(BROVFS_ENABLE_API)
     # bronze (with brass, its code generator) through cmake/bro_deps.cmake: an
     # outer project's target, else ../bronze beside the top-level project, else
     # the pinned commit, fetched at configure.
-    bro_dependency(bronze GITHUB wlejon/bronze REF 15ce4cf5fc25d8afe03882985ae95adcba46a6a9 TARGET bronze_runtime_shared
+    bro_dependency(bronze GITHUB wlejon/bronze TARGET bronze_runtime_shared
                    OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
 
     add_subdirectory(src/api)
