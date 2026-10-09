@@ -12,7 +12,7 @@ concurrency:
 
 # The brovfs library has no sibling dependencies: the OS is the only thing it
 # links. Its JavaScript binding (brovfs_api) binds bronze, which, with brass,
-# comes from the commit CMakeLists.txt pins (cmake/bro_deps.cmake), fetched at
+# comes from the head of its main branch (cmake/bro_deps.cmake), fetched at
 # configure: every job builds a plain clone.
 #
 # The tests are real: they copy, move, trash and watch files on the runner's

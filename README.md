@@ -137,7 +137,7 @@ target_link_libraries(your_target PRIVATE brovfs::brovfs)
 
 Ecosystem consumers pin brovfs with `bro_dependency(brovfs ...)` (`cmake/bro_deps.cmake`):
 a target the outer project already added wins, else a `../brovfs` working tree beside the
-top-level project, else the pinned commit, fetched at configure. Point at another tree with
+top-level project, else the head of its main branch, fetched at configure. Point at another tree with
 `-DFETCHCONTENT_SOURCE_DIR_BROVFS=<path>`.
 
 ### Optional Bronze JavaScript API
@@ -145,7 +145,7 @@ top-level project, else the pinned commit, fetched at configure. Point at anothe
 The standalone JavaScript binding (`BROVFS_ENABLE_API`, on when brovfs is the top-level
 project) compiles `brovfs_api` for the [bronze](https://github.com/wlejon/bronze) engine.
 bronze (with brass) resolves the same way: `../bronze` beside the top-level project, else the
-pinned commit, fetched at configure, so a plain clone builds. Set `-DBROVFS_ENABLE_API=OFF`
+head of its main branch, fetched at configure, so a plain clone builds. Set `-DBROVFS_ENABLE_API=OFF`
 for pure C++ builds without JavaScript support.
 
 ## Tests
