@@ -36,8 +36,6 @@ jobs:
         with:
           path: brovfs
 
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
-
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
 

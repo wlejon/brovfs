@@ -11,9 +11,9 @@ concurrency:
   cancel-in-progress: true
 
 # The brovfs library has no sibling dependencies: the OS is the only thing it
-# links. Its JavaScript binding (brovfs_api) binds bronze, so every job lays
-# out ../bronze and ../brass with bronze's checkout-toolchain action, and the
-# repo is checked out into a named path (brovfs/) to make that layout work.
+# links. Its JavaScript binding (brovfs_api) binds bronze, which, with brass,
+# comes from the commit CMakeLists.txt pins (cmake/bro_deps.cmake), fetched at
+# configure: every job builds a plain clone.
 #
 # The tests are real: they copy, move, trash and watch files on the runner's
 # own file system, create a subst drive (Windows), a bind mount in a private
@@ -37,10 +37,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brovfs
-
-      # bronze + brass beside the repo, for brovfs_api (BROVFS_ENABLE_API is
-      # on whenever brovfs is the top-level project).
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install packages (Linux)
         if: runner.os == 'Linux'
@@ -87,8 +83,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brovfs
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
         run: |

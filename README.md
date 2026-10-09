@@ -135,29 +135,18 @@ add_subdirectory(path/to/brovfs)
 target_link_libraries(your_target PRIVATE brovfs::brovfs)
 ```
 
-In accordance with the ecosystem dependency convention, consumers support two checkout
-layouts:
-
-1. **Sibling checkout (development default):**
-   Checked out alongside the consumer at `../brovfs` (can be overridden via `-DBROVFS_DIR=<path>`):
-   ```bash
-   git clone https://github.com/wlejon/broapps
-   git clone https://github.com/wlejon/brovfs    # Sibling directory
-   ```
-2. **Submodule layout (isolated / CI builds):**
-   Embedded as a git submodule inside `third_party/brovfs`:
-   ```bash
-   git clone --recursive https://github.com/wlejon/broapps
-   # or initialize in an existing checkout:
-   git submodule update --init --recursive
-   ```
+Ecosystem consumers pin brovfs with `bro_dependency(brovfs ...)` (`cmake/bro_deps.cmake`):
+a target the outer project already added wins, else a `../brovfs` working tree beside the
+top-level project, else the pinned commit, fetched at configure. Point at another tree with
+`-DFETCHCONTENT_SOURCE_DIR_BROVFS=<path>`.
 
 ### Optional Bronze JavaScript API
 
-The standalone JavaScript binding (`BROVFS_ENABLE_API=ON`, default) compiles `brovfs_api`
-for the [bronze](https://github.com/wlejon/bronze) engine. It requires `../bronze` and
-`../brass` checked out beside this repository, or `-DBRONZE_DIR=<path>`. Set
-`-DBROVFS_ENABLE_API=OFF` for pure C++ builds without JavaScript support.
+The standalone JavaScript binding (`BROVFS_ENABLE_API`, on when brovfs is the top-level
+project) compiles `brovfs_api` for the [bronze](https://github.com/wlejon/bronze) engine.
+bronze (with brass) resolves the same way: `../bronze` beside the top-level project, else the
+pinned commit, fetched at configure, so a plain clone builds. Set `-DBROVFS_ENABLE_API=OFF`
+for pure C++ builds without JavaScript support.
 
 ## Tests
 
