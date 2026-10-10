@@ -7,6 +7,7 @@ add_library(brovfs_api STATIC
     native_vfs_watch.cpp
     native_vfs_model.cpp
     native_vfs_misc.cpp
+    native_vfs_usage.cpp
 )
 
 target_include_directories(brovfs_api PUBLIC

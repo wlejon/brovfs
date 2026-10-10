@@ -21,6 +21,7 @@ set(BROVFS_TESTS
     test_dsstore
     test_model
     test_undo
+    test_usage
 )
 
 foreach(name IN LISTS BROVFS_TESTS)

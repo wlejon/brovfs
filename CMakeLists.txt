@@ -52,6 +52,7 @@ set(BROVFS_SOURCES
     src/transfer.cpp
     src/trash_common.cpp
     src/types.cpp
+    src/usage.cpp
     src/version.cpp
     src/volume_monitor.cpp
     src/volumes.cpp

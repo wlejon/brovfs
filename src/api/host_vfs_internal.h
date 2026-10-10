@@ -59,11 +59,15 @@ void installTrashOnto(Value vfsObj);
 void installWatchOnto(Value vfsObj);
 void installModelOnto(Value vfsObj);
 void installMiscOnto(Value vfsObj);
+void installUsageOnto(Value vfsObj);
 
 void drainWatcherEvents();
 void clearWatchers();
 
 void drainModelUpdates();
 void clearModels();
+
+void drainUsageScans();
+void clearUsageScans();
 
 } // namespace brovfs::api

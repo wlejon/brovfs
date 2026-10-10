@@ -39,6 +39,35 @@ void installMiscOnto(Value vfsObj) {
         }
         return arr.get();
     });
+
+    // bro.vfs.volumes() -> Promise<Volume[]>: listVolumes off the calling thread. Asking a
+    // volume for its size can take seconds (a sleeping disk, an unreachable network share),
+    // so a window that lists drives at startup uses this.
+    vfs.def("volumes", 0, [](Value, std::span<const Value>) -> Value {
+        ev::Persistent promise(ev::createPromise());
+        auto job = std::make_shared<VfsAsyncJob>();
+        job->promise.set(promise.get());
+        auto vols = std::make_shared<std::vector<bro::vfs::VolumeInfo>>();
+        job->run = [vols] { *vols = bro::vfs::list_volumes(); };
+        job->settle = [vols](Value pVal) {
+            ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(vols->size())));
+            for (size_t i = 0; i < vols->size(); ++i) {
+                ev::Persistent itemVal(volumeInfoToJs((*vols)[i]));
+                arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), itemVal.get()));
+            }
+            ev::resolvePromise(pVal, arr.get());
+        };
+        job->worker = std::thread([job] {
+            try {
+                job->run();
+            } catch (const std::exception& e) {
+                job->error = e.what();
+            }
+            job->done.store(true, std::memory_order_release);
+        });
+        trackAsyncJob(job);
+        return promise.get();
+    });
 }
 
 } // namespace brovfs::api

@@ -237,18 +237,21 @@ void installVfs() {
     installWatchOnto(vfsObj.get());
     installModelOnto(vfsObj.get());
     installMiscOnto(vfsObj.get());
+    installUsageOnto(vfsObj.get());
 }
 
 void tickVfsAsync() {
     drainAsyncJobs();
     drainWatcherEvents();
     drainModelUpdates();
+    drainUsageScans();
 }
 
 void shutdownVfsAsync() {
     cancelAllAsyncJobs();
     clearWatchers();
     clearModels();
+    clearUsageScans();
 }
 
 } // namespace brovfs::api

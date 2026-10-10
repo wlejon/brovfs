@@ -11,6 +11,7 @@
 #include "brovfs/trash.h"
 #include "brovfs/types.h"
 #include "brovfs/undo.h"
+#include "brovfs/usage.h"
 #include "brovfs/version.h"
 #include "brovfs/volumes.h"
 #include "brovfs/watcher.h"
