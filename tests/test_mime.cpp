@@ -36,6 +36,17 @@ static void test_signatures() {
     CHECK(sniff({'f', 'L', 'a', 'C', 0, 0, 0, 0x22}) == "audio/flac");
     CHECK(sniff({'I', 'D', '3', 4, 0, 0, 0, 0}) == "audio/mpeg");
     CHECK(sniff({0, 0, 0, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 2, 0}) == "video/mp4");
+    // HEIF: the major brand, else the compatible brands of a structural mif1 file.
+    CHECK(sniff({0, 0, 0, 0x14, 'f', 't', 'y', 'p', 'a', 'v', 'i', 'f', 0, 0, 0, 0, 'm', 'i', 'f', '1'}) == "image/avif");
+    CHECK(sniff({0, 0, 0, 0x14, 'f', 't', 'y', 'p', 'h', 'e', 'i', 'c', 0, 0, 0, 0, 'm', 'i', 'f', '1'}) == "image/heic");
+    CHECK(sniff({0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1', 'a', 'v', 'i',
+                 'f'}) == "image/avif");
+    CHECK(sniff({0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1', 'h', 'e', 'i',
+                 'c'}) == "image/heic");
+    CHECK(sniff({0, 0, 0, 0x14, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1'}) == "image/heif");
+    // Brands past the box are not read.
+    CHECK(sniff({0, 0, 0, 0x14, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1', 'a', 'v', 'i',
+                 'f'}) == "image/heif");
     CHECK(sniff({'R', 'I', 'F', 'F', 0x40, 0, 0, 0, 'A', 'V', 'I', ' ', 'L', 'I', 'S', 'T'}) == "video/x-msvideo");
     CHECK(vfs::get_mime_category("image/png") == "image" && vfs::get_mime_category("audio/wav") == "audio");
 

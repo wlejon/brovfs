@@ -192,7 +192,22 @@ std::string sniff_mime_type(std::span<const uint8_t> data) {
     if (data.size() >= 12 && std::memcmp(data.data() + 4, "ftyp", 4) == 0) {
         std::string_view brand(reinterpret_cast<const char*>(data.data() + 8), 4);
         if (brand == "avif" || brand == "avis") return "image/avif";
-        if (brand == "heic" || brand == "mif1") return "image/heif";
+        if (brand == "heic" || brand == "heix" || brand == "heim" || brand == "heis" || brand == "hevc" ||
+            brand == "hevx") {
+            return "image/heic";
+        }
+        if (brand == "mif1" || brand == "msf1" || brand == "miaf") {
+            // A structural brand: the compatible brands (after minor_version) name the codec.
+            uint32_t box = (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) | (uint32_t(data[2]) << 8) | data[3];
+            size_t end = std::min<size_t>(data.size(), box < 16 ? 16 : box);
+            bool heic = false;
+            for (size_t p = 16; p + 4 <= end; p += 4) {
+                std::string_view c(reinterpret_cast<const char*>(data.data() + p), 4);
+                if (c == "avif" || c == "avis") return "image/avif";
+                if (c == "heic" || c == "heix" || c == "heim" || c == "heis" || c == "hevc" || c == "hevx") heic = true;
+            }
+            return heic ? "image/heic" : "image/heif";
+        }
         if (brand == "M4A " || brand == "M4B ") return "audio/mp4";
         if (brand == "qt  ") return "video/quicktime";
         return "video/mp4";
