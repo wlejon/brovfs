@@ -498,40 +498,29 @@ int main() {
         }, 3000);
         CHECK(loaded);
 
+        // The setters are asynchronous (dir_model.h): each takes effect on the
+        // model thread, so wait for the entries to show it.
+        auto modelShows = [](const char* check) {
+            return pumpUntil([check]() {
+                auto v = evalScript(std::string("(function() {\n"
+                                                "  const entries = globalThis._model.entries();\n") +
+                                    check + "\n})()\n");
+                return !v.thrown && ev::isBool(v.value) && ev::toBool(v.value);
+            }, 3000);
+        };
+
         // Test sorting
         evalScript("globalThis._model.setSort('name', true);");
-        auto rSort = evalScript(
-            "(function() {\n"
-            "  const entries = globalThis._model.entries();\n"
-            "  if (entries.length !== 3) return false;\n"
-            "  if (entries[0].name !== 'a_file.txt') return false;\n"
-            "  if (entries[1].name !== 'b_file.txt') return false;\n"
-            "  if (entries[2].name !== 'c_file.txt') return false;\n"
-            "  return true;\n"
-            "})()\n"
-        );
-        CHECK(!rSort.thrown && ev::isBool(rSort.value) && ev::toBool(rSort.value));
+        CHECK(modelShows("  return entries.length === 3 && entries[0].name === 'a_file.txt' &&\n"
+                         "         entries[1].name === 'b_file.txt' && entries[2].name === 'c_file.txt';"));
 
         // Test filtering
         evalScript("globalThis._model.setFilter('b_');");
-        auto rFilter = evalScript(
-            "(function() {\n"
-            "  const entries = globalThis._model.entries();\n"
-            "  if (entries.length !== 1 || entries[0].name !== 'b_file.txt') return false;\n"
-            "  return true;\n"
-            "})()\n"
-        );
-        CHECK(!rFilter.thrown && ev::isBool(rFilter.value) && ev::toBool(rFilter.value));
+        CHECK(modelShows("  return entries.length === 1 && entries[0].name === 'b_file.txt';"));
 
         // Reset filter
         evalScript("globalThis._model.setFilter('');");
-        auto rResetFilter = evalScript(
-            "(function() {\n"
-            "  const entries = globalThis._model.entries();\n"
-            "  return entries.length === 3;\n"
-            "})()\n"
-        );
-        CHECK(!rResetFilter.thrown && ev::isBool(rResetFilter.value) && ev::toBool(rResetFilter.value));
+        CHECK(modelShows("  return entries.length === 3;"));
 
         // Test change callback
         evalScript(
