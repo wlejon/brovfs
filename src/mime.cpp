@@ -208,6 +208,7 @@ std::string sniff_mime_type(std::span<const uint8_t> data) {
             }
             return heic ? "image/heic" : "image/heif";
         }
+        if (brand == "crx ") return "image/x-canon-cr3";  // Canon RAW 3, an ISO media file
         if (brand == "M4A " || brand == "M4B ") return "audio/mp4";
         if (brand == "qt  ") return "video/quicktime";
         return "video/mp4";

@@ -25,6 +25,7 @@ constexpr Ext kExtensions[] = {
     {"avif", "image/avif"},
     {"heic", "image/heic"},
     {"heif", "image/heif"},
+    {"cr3", "image/x-canon-cr3"},
     {"jxl", "image/jxl"},
     {"qoi", "image/qoi"},
     {"psd", "image/vnd.adobe.photoshop"},

@@ -44,6 +44,9 @@ static void test_signatures() {
     CHECK(sniff({0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1', 'h', 'e', 'i',
                  'c'}) == "image/heic");
     CHECK(sniff({0, 0, 0, 0x14, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1'}) == "image/heif");
+    // Canon CR3 is ISO media too, brand "crx ".
+    CHECK(sniff({0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 1, 'c', 'r', 'x', ' ', 'i', 's', 'o',
+                 'm'}) == "image/x-canon-cr3");
     // Brands past the box are not read.
     CHECK(sniff({0, 0, 0, 0x14, 'f', 't', 'y', 'p', 'm', 'i', 'f', '1', 0, 0, 0, 0, 'm', 'i', 'f', '1', 'a', 'v', 'i',
                  'f'}) == "image/heif");
