@@ -348,16 +348,20 @@ private:
                         dirs.push_back(Listed{std::move(e.name_utf8), e.st, hidden});
                         return true;
                     }
+                    // A link holds none of its target's bytes. POSIX lstat sizes a symlink
+                    // by the length of the path it names, Windows sizes a reparse point 0;
+                    // both count as 0 so a tree totals the same everywhere.
+                    const bool link = e.st.kind == FileKind::Symlink || e.st.kind == FileKind::Junction;
                     FileRec fr;
                     fr.name_off = static_cast<uint32_t>(names.size());
                     fr.name_len = static_cast<uint32_t>(e.name_utf8.size());
-                    fr.size = e.st.size;
+                    fr.size = link ? 0 : e.st.size;
                     fr.mtime_ms = e.st.mtime_ns / 1000000;
                     fr.kind = e.st.kind;
                     fr.hidden = hidden;
                     names += e.name_utf8;
                     recs.push_back(fr);
-                    bytes += e.st.size;
+                    bytes += fr.size;
                     return true;
                 },
                 ec);

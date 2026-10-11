@@ -6,7 +6,7 @@
 //
 // The tree is kept compactly (a node per directory, a small record per file), so a drive of a
 // few million files costs on the order of 50 bytes per file. Links are counted, never
-// followed; sizes are logical (the bytes a file holds, not the clusters it occupies).
+// followed, as files of 0 bytes; sizes are logical (the bytes a file holds, not the clusters it occupies).
 
 #include "brovfs/scanner.h"
 
