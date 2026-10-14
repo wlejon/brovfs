@@ -33,20 +33,32 @@ static void test_basic(const Scratch& s) {
     r = vfs::scan_directory(root, rec);
     CHECK(r.entries.size() == count_tree(root));
     for (auto& e : r.entries) {
-        if (e.name == "a.txt") CHECK(e.size == 2 && e.kind == vfs::FileKind::Regular && e.depth == 0);
-        if (e.name == "c.txt") CHECK(e.depth == 2);
-        if (e.name == "sub") CHECK(e.kind == vfs::FileKind::Directory);
+        if (e.name == "a.txt") CHECK(e.size == 2 && e.kind == vfs::FileKind::Regular && e.depth == 0 && !e.is_hidden);
+        if (e.name == "c.txt") CHECK(e.depth == 2 && !e.is_hidden);
+        if (e.name == "sub") CHECK(e.kind == vfs::FileKind::Directory && !e.is_hidden);
+        if (e.name == ".hidden") CHECK(e.is_hidden);
         CHECK(e.mtime_ms > 0);
     }
     vfs::ScanOptions depth1 = rec;
     depth1.max_depth = 2;
     r = vfs::scan_directory(root, depth1);
     CHECK(names_of(r).count("b.txt") == 1 && names_of(r).count("c.txt") == 0);
-#ifndef _WIN32
     vfs::ScanOptions nohidden = rec;
     nohidden.include_hidden = false;
     CHECK(names_of(vfs::scan_directory(root, nohidden)).count(".hidden") == 0);
-#endif
+
+    // Forward-slash parent path keeps forward-slash separators in every entry.path.
+    std::string fwdRoot = u8(root);
+    for (char& ch : fwdRoot) {
+        if (ch == '\\') ch = '/';
+    }
+    auto fwdScan = vfs::scan_directory(p8(fwdRoot), rec);
+    CHECK(fwdScan.complete() && fwdScan.entries.size() == count_tree(root));
+    for (const auto& e : fwdScan.entries) {
+        std::string ep = u8(e.path);
+        CHECK_MSG(ep.find('\\') == std::string::npos && ep.rfind(fwdRoot + "/", 0) == 0, ep);
+    }
+
     auto missing = vfs::scan_directory(s / "does-not-exist", flat);
     CHECK(!missing.complete() && missing.errors.size() == 1);
 }

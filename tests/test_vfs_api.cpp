@@ -171,16 +171,17 @@ int main() {
         writeFile(scanDir / "file2.txt", "22");
         writeFile(scanDir / "sub" / "file3.txt", "333");
         writeFile(scanDir / ".hidden.txt", "secret");
-#ifdef _WIN32
-        // A leading dot hides a file on POSIX only; Windows hides by attribute.
-        SetFileAttributesW((scanDir / ".hidden.txt").c_str(), FILE_ATTRIBUTE_HIDDEN);
-#endif
+
+        std::string fwdScanDir = scanDir.string();
+        for (char& ch : fwdScanDir) {
+            if (ch == '\\') ch = '/';
+        }
 
         std::string script =
             "(function() {\n"
             "  globalThis._scanDone = false;\n"
             "  globalThis._scanEntries = null;\n"
-            "  bro.vfs.scan('" + jsPath(scanDir) + "', { recursive: true, includeHidden: true })\n"
+            "  bro.vfs.scan('" + fwdScanDir + "', { recursive: true, includeHidden: true })\n"
             "    .then(entries => {\n"
             "      globalThis._scanDone = true;\n"
             "      globalThis._scanEntries = entries;\n"
@@ -207,8 +208,10 @@ int main() {
             "  if (entries.length !== 5) return 'expected 5 entries, got ' + names.join(',');\n" // file1, file2, sub, file3, .hidden
             "  for (const n of ['file1.txt', 'sub', 'file3.txt', '.hidden.txt'])\n"
             "    if (!names.includes(n)) return 'missing ' + n + ' in ' + names.join(',');\n"
+            "  for (const e of entries)\n"
+            "    if (typeof e.path !== 'string' || e.path.includes('\\\\')) return 'mixed path: ' + e.path;\n"
             "  const f1 = entries.find(e => e.name === 'file1.txt');\n"
-            "  if (!f1.isRegular || f1.size !== 1) return 'file1.txt: ' + JSON.stringify(f1);\n"
+            "  if (!f1.isRegular || f1.size !== 1 || f1.isHidden) return 'file1.txt: ' + JSON.stringify(f1);\n"
             "  const sub = entries.find(e => e.name === 'sub');\n"
             "  if (!sub.isDirectory) return 'sub: ' + JSON.stringify(sub);\n"
             "  const hid = entries.find(e => e.name === '.hidden.txt');\n"

@@ -25,7 +25,14 @@ static void test_path_shapes() {
     CHECK(vfs::leaf_name(fs::path("a/b/")) == fs::path("b"));
     CHECK(vfs::leaf_name(fs::path("a/b")) == fs::path("b"));
     CHECK(vfs::strip_trailing_separators(fs::path("a/b//")) == fs::path("a/b"));
+    CHECK(u8(vfs::join_path(p8("a/b"), p8("c.txt"))) == "a/b/c.txt");
+    CHECK(u8(vfs::join_path(p8("a/b/"), p8("c.txt"))) == "a/b/c.txt");
+    CHECK(u8(vfs::join_path(fs::path(), p8("c.txt"))) == "c.txt");
+    CHECK(u8(vfs::join_path(p8("a/b"), fs::path())) == "a/b");
 #ifdef _WIN32
+    CHECK(u8(vfs::join_path(p8("D:/path"), p8("name"))) == "D:/path/name");
+    CHECK(u8(vfs::join_path(p8("D:/path/"), p8("name"))) == "D:/path/name");
+    CHECK(u8(vfs::join_path(p8("D:\\path"), p8("name"))) == "D:\\path\\name");
     CHECK(vfs::leaf_name(fs::path(L"C:\\")).empty());
     CHECK(vfs::win_extended_path(fs::path(L"C:\\x\\..\\y\\")) == L"\\\\?\\C:\\y");
     CHECK(vfs::win_extended_path(fs::path(L"\\\\server\\share\\d")) == L"\\\\?\\UNC\\server\\share\\d");

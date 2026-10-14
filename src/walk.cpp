@@ -1,5 +1,7 @@
 #include "src/walk.h"
 
+#include "brovfs/path.h"
+
 #include <algorithm>
 #include <vector>
 
@@ -16,12 +18,12 @@
 namespace bro::vfs::detail {
 
 bool is_hidden(const std::string& name, const sys::Stat& st) {
+    if (!name.empty() && name[0] == '.') return true;
 #ifdef _WIN32
-    (void)name;
     return (st.attributes & FILE_ATTRIBUTE_HIDDEN) != 0;
 #else
     (void)st;
-    return !name.empty() && name[0] == '.';
+    return false;
 #endif
 }
 
@@ -140,8 +142,8 @@ bool walk(const fs::path& root, const WalkOptions& options, const CancellationTo
         if (!options.include_hidden && is_hidden(child.name_utf8, child.st)) continue;
 
         WalkNode node;
-        node.path = top.path / child.name;
-        node.rel = top.rel.empty() ? child.name : top.rel / child.name;
+        node.path = join_path(top.path, child.name);
+        node.rel = top.rel.empty() ? child.name : join_path(top.rel, child.name);
         node.name = std::move(child.name_utf8);
         node.st = child.st;
         node.stat_error = child.stat_error;

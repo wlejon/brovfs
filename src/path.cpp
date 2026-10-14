@@ -127,4 +127,21 @@ fs::path leaf_name(const fs::path& p) {
     return strip_trailing_separators(p).filename();
 }
 
+fs::path join_path(const fs::path& dir, const fs::path& name) {
+    if (dir.empty()) return name;
+    if (name.empty()) return dir;
+#ifdef _WIN32
+    const std::wstring& d = dir.native();
+    if (d.find(L'/') != std::wstring::npos && d.find(L'\\') == std::wstring::npos) {
+        std::wstring n = name.native();
+        for (auto& ch : n) {
+            if (ch == L'\\') ch = L'/';
+        }
+        if (d.back() == L'/') return fs::path(d + n);
+        return fs::path(d + L'/' + n);
+    }
+#endif
+    return dir / name;
+}
+
 } // namespace bro::vfs

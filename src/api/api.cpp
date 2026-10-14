@@ -148,7 +148,7 @@ void cancelAllAsyncJobs() {
 
 Value entryToJs(const bro::vfs::FileEntry& entry) {
     ObjectBuilder b;
-    b.set("path", entry.path.string());
+    b.set("path", bro::vfs::path_to_utf8(entry.path));
     b.set("name", entry.name);
     b.set("kind", std::string(to_string(entry.kind)));
     b.set("isDirectory", entry.is_directory());
@@ -177,8 +177,8 @@ Value opResultToJs(const bro::vfs::OpResult& result) {
     for (size_t i = 0; i < result.errors.size(); ++i) {
         const auto& err = result.errors[i];
         ObjectBuilder eb;
-        eb.set("source", err.source.string());
-        eb.set("destination", err.destination.string());
+        eb.set("source", bro::vfs::path_to_utf8(err.source));
+        eb.set("destination", bro::vfs::path_to_utf8(err.destination));
         eb.set("operation", err.operation);
         eb.set("message", err.message());
         eb.set("code", static_cast<double>(err.code.value()));
@@ -191,8 +191,8 @@ Value opResultToJs(const bro::vfs::OpResult& result) {
 Value trashItemToJs(const bro::vfs::TrashItem& item) {
     ObjectBuilder b;
     b.set("id", item.id);
-    b.set("originalPath", item.original_path.string());
-    b.set("storedPath", item.stored_path.string());
+    b.set("originalPath", bro::vfs::path_to_utf8(item.original_path));
+    b.set("storedPath", bro::vfs::path_to_utf8(item.stored_path));
     b.set("name", item.name);
     b.set("deletionTime", static_cast<double>(item.deletion_time_ms));
     b.set("size", static_cast<double>(item.size));
@@ -202,7 +202,7 @@ Value trashItemToJs(const bro::vfs::TrashItem& item) {
 
 Value volumeInfoToJs(const bro::vfs::VolumeInfo& vol) {
     ObjectBuilder b;
-    b.set("mountPoint", vol.mount_point.string());
+    b.set("mountPoint", bro::vfs::path_to_utf8(vol.mount_point));
     b.set("volumeLabel", vol.volume_label);
     b.set("fsType", vol.fs_type);
     b.set("totalBytes", static_cast<double>(vol.total_bytes));
@@ -219,9 +219,9 @@ Value watchEventToJs(const bro::vfs::WatchEvent& evItem) {
     ObjectBuilder b;
     b.set("kind", std::string(to_string(evItem.kind)));
     b.set("watch", static_cast<double>(evItem.watch));
-    b.set("path", evItem.path.string());
+    b.set("path", bro::vfs::path_to_utf8(evItem.path));
     if (evItem.kind == bro::vfs::WatchEventKind::Renamed) {
-        b.set("oldPath", evItem.old_path.string());
+        b.set("oldPath", bro::vfs::path_to_utf8(evItem.old_path));
     }
     if (evItem.error) {
         b.set("error", evItem.error.message());

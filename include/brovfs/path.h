@@ -25,5 +25,7 @@ namespace bro::vfs {
 [[nodiscard]] std::filesystem::path strip_trailing_separators(const std::filesystem::path& p);
 // The last component, ignoring trailing separators. Empty for roots.
 [[nodiscard]] std::filesystem::path leaf_name(const std::filesystem::path& p);
+// Joins `dir` and `name`, keeping `/` when `dir` is spelled with `/` (and no `\`) on Windows.
+[[nodiscard]] std::filesystem::path join_path(const std::filesystem::path& dir, const std::filesystem::path& name);
 
 } // namespace bro::vfs

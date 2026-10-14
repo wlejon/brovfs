@@ -105,10 +105,10 @@ public:
         const DirNode& n = nodes_[d];
         fs::path base = node_path_locked(d);
         out.reserve(n.subdirs.size() + n.files_here.size());
-        for (uint32_t c : n.subdirs) out.push_back(dir_item_locked(c, base / path_from_utf8(nodes_[c].name)));
+        for (uint32_t c : n.subdirs) out.push_back(dir_item_locked(c, join_path(base, path_from_utf8(nodes_[c].name))));
         for (const auto& fr : n.files_here) {
             std::string name = n.names.substr(fr.name_off, fr.name_len);
-            fs::path p = base / path_from_utf8(name);
+            fs::path p = join_path(base, path_from_utf8(name));
             out.push_back(file_item(fr, std::move(name), std::move(p)));
         }
         auto by_bytes = [](const UsageItem& a, const UsageItem& b) {
@@ -138,7 +138,7 @@ public:
         if (f) {
             const DirNode& n = nodes_[d];
             std::string name = n.names.substr(f->name_off, f->name_len);
-            out = file_item(*f, name, node_path_locked(d) / path_from_utf8(name));
+            out = file_item(*f, name, join_path(node_path_locked(d), path_from_utf8(name)));
         } else {
             out = dir_item_locked(d, node_path_locked(d));
         }
@@ -201,7 +201,7 @@ private:
         std::vector<uint32_t> chain;
         for (uint32_t a = d; a != 0 && a != kNone; a = nodes_[a].parent) chain.push_back(a);
         fs::path p = root_;
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) p /= path_from_utf8(nodes_[*it].name);
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) p = join_path(p, path_from_utf8(nodes_[*it].name));
         return p;
     }
 

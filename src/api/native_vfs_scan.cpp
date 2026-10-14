@@ -1,4 +1,5 @@
 #include "host_vfs_internal.h"
+#include "brovfs/path.h"
 #include "brovfs/scanner.h"
 
 namespace brovfs::api {
@@ -38,14 +39,14 @@ void installScanOnto(Value vfsObj) {
 
         auto resultPtr = std::make_shared<bro::vfs::ScanResult>();
         job->run = [pathStr, scanOpts, resultPtr]() {
-            *resultPtr = bro::vfs::scan_directory(std::filesystem::path(pathStr), scanOpts);
+            *resultPtr = bro::vfs::scan_directory(bro::vfs::path_from_utf8(pathStr), scanOpts);
         };
 
 
         job->settle = [resultPtr](Value pVal) {
             if (!resultPtr->errors.empty() && resultPtr->entries.empty()) {
                 const auto& firstErr = resultPtr->errors[0];
-                std::string msg = "Scan failed for " + firstErr.path.string() + ": " + firstErr.code.message();
+                std::string msg = "Scan failed for " + bro::vfs::path_to_utf8(firstErr.path) + ": " + firstErr.code.message();
                 ev::Persistent err(makeError(msg));
                 ev::rejectPromise(pVal, err.get());
                 return;
