@@ -16,6 +16,14 @@ std::unordered_map<const HostClass*, HostClass::Slots>& threadSlots() {
     return t;
 }
 
+struct BrandedHandle {
+    static constexpr uint64_t kMagic = 0x42524F5646534843ULL; // "BROVFSHC"
+    uint64_t magic = kMagic;
+    const HostClass* cls = nullptr;
+    void* data = nullptr;
+    ev::HandleDestructor dtor = nullptr;
+};
+
 } // namespace
 
 HostClass::Slots& HostClass::slots() const {
@@ -42,6 +50,11 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
     }
 
     Slots& s = slots();
+    delete s.ctor;
+    delete s.proto;
+    s.ctor = nullptr;
+    s.proto = nullptr;
+
     ev::Persistent ctor(ev::makeFunction(std::move(ctorBody), arity, name));
     s.ctor = new ev::Persistent(ctor.get());
 
@@ -55,7 +68,8 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
     ev::registerGlobal(name, s.ctor->get());
     ev::GlobalValue gt = ev::globalValue("globalThis");
     if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, name, s.ctor->get());
+        ev::Persistent gtObj(gt.value);
+        ev::setProperty(gtObj.get(), name, s.ctor->get());
     }
 }
 
@@ -65,7 +79,8 @@ void HostClass::alias(const char* name) const {
     ev::registerGlobal(name, s->ctor->get());
     ev::GlobalValue gt = ev::globalValue("globalThis");
     if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, name, s->ctor->get());
+        ev::Persistent gtObj(gt.value);
+        ev::setProperty(gtObj.get(), name, s->ctor->get());
     }
 }
 
@@ -83,15 +98,29 @@ void HostClass::inherit(const HostClass& base) const {
 }
 
 Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) const {
+    auto* bh = new BrandedHandle{BrandedHandle::kMagic, this, data, dtor};
+    auto wrapperDtor = +[](void* raw) {
+        auto* b = static_cast<BrandedHandle*>(raw);
+        if (b->dtor) b->dtor(b->data);
+        b->magic = 0;
+        delete b;
+    };
     const Slots* s = slotsIfAny();
-    if (!s || !s->proto) return ev::makeHandle(data, dtor, when);
-    return ev::makeHandle(data, dtor, when, s->proto->get());
+    if (!s || !s->proto) return ev::makeHandle(bh, wrapperDtor, when);
+    return ev::makeHandle(bh, wrapperDtor, when, s->proto->get());
+}
+
+void* HostClass::unwrap(Value val) const {
+    auto* bh = static_cast<BrandedHandle*>(ev::handleData(val));
+    if (!bh || bh->magic != BrandedHandle::kMagic || bh->cls != this) return nullptr;
+    return bh->data;
 }
 
 void HostClass::setStatic(const char* name, Value v) const {
     const Slots* s = slotsIfAny();
     if (!s || !s->ctor) return;
-    s->ctor->set(ev::setProperty(s->ctor->get(), name, v));
+    ev::Persistent valP(v);
+    s->ctor->set(ev::setProperty(s->ctor->get(), name, valP.get()));
 }
 
 Value HostClass::prototype() const {

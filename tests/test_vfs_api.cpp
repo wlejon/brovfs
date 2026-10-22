@@ -550,6 +550,35 @@ int main() {
         auto rCount4 = evalScript("globalThis._model.entries().length;");
         CHECK(!rCount4.thrown && ev::isNumber(rCount4.value) && ev::toDouble(rCount4.value) == 4.0);
 
+        // Test cross-class HostClass::unwrap brand safety (DirectoryModel vs UsageScan)
+        std::string crossClassScript =
+            "(function() {\n"
+            "  const scan = bro.vfs.usage('" + jsPath(modelDir) + "');\n"
+            "  const dmProto = Object.getPrototypeOf(globalThis._model);\n"
+            "  const usProto = Object.getPrototypeOf(scan);\n"
+            "  const fakeEntries = dmProto.entries.call(scan);\n"
+            "  if (!Array.isArray(fakeEntries) || fakeEntries.length !== 0) return false;\n"
+            "  const fakeProg = usProto.progress.call(globalThis._model);\n"
+            "  if (fakeProg !== undefined) return false;\n"
+            "  const fakeRm = usProto.remove.call(globalThis._model, 'x');\n"
+            "  if (fakeRm !== false) return false;\n"
+            "  usProto.cancel.call(globalThis._model);\n"
+            "  scan.cancel();\n"
+            "  return true;\n"
+            "})()\n";
+        auto rCross = evalScript(crossClassScript);
+        CHECK(!rCross.thrown && ev::isBool(rCross.value) && ev::toBool(rCross.value));
+
+        // Test DirectoryModel.prototype.close()
+        auto rClose = evalScript(
+            "(function() {\n"
+            "  if (typeof globalThis._model.close !== 'function') return false;\n"
+            "  globalThis._model.close();\n"
+            "  return globalThis._model.entries().length === 0;\n"
+            "})()\n"
+        );
+        CHECK(!rClose.thrown && ev::isBool(rClose.value) && ev::toBool(rClose.value));
+
         std::cout << "  DirectoryModel [PASS]" << std::endl;
     }
 

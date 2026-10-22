@@ -20,7 +20,7 @@ struct WrappedModel {
 };
 
 std::mutex g_model_mu;
-std::vector<std::shared_ptr<WrappedModel>> g_active_models;
+std::vector<std::weak_ptr<WrappedModel>> g_active_models;
 
 std::string strToLower(std::string_view sv) {
     std::string s;
@@ -54,7 +54,14 @@ void drainModelUpdates() {
     std::vector<std::shared_ptr<WrappedModel>> models;
     {
         std::lock_guard lock(g_model_mu);
-        models = g_active_models;
+        for (auto it = g_active_models.begin(); it != g_active_models.end();) {
+            if (auto locked = it->lock()) {
+                models.push_back(std::move(locked));
+                ++it;
+            } else {
+                it = g_active_models.erase(it);
+            }
+        }
     }
 
     for (auto& wrapped : models) {
@@ -77,8 +84,20 @@ void drainModelUpdates() {
 }
 
 void clearModels() {
-    std::lock_guard lock(g_model_mu);
-    g_active_models.clear();
+    std::vector<std::shared_ptr<WrappedModel>> models;
+    {
+        std::lock_guard lock(g_model_mu);
+        for (auto& wk : g_active_models) {
+            if (auto locked = wk.lock()) {
+                models.push_back(std::move(locked));
+            }
+        }
+        g_active_models.clear();
+    }
+    for (auto& w : models) {
+        w->change_callbacks.clear();
+        w->model.reset();
+    }
 }
 
 void installModelOnto(Value vfsObj) {
@@ -230,6 +249,15 @@ void installModelOnto(Value vfsObj) {
                 (*wrappedPtr)->change_callbacks.push_back(std::make_unique<ev::Persistent>(args[1]));
             }
             return self;
+        });
+
+        // close()
+        proto.def("close", 0, [](Value self, std::span<const Value>) -> Value {
+            auto wrappedPtr = static_cast<std::shared_ptr<WrappedModel>*>(g_directoryModelClass.unwrap(self));
+            if (!wrappedPtr || !*wrappedPtr) return ev::undefined();
+            (*wrappedPtr)->change_callbacks.clear();
+            (*wrappedPtr)->model.reset();
+            return ev::undefined();
         });
     });
 
