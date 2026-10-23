@@ -1,6 +1,7 @@
 #include "host_class.h"
 #include "object_builder.h"
 
+#include <mutex>
 #include <unordered_map>
 
 namespace brovfs::api {
@@ -16,13 +17,34 @@ std::unordered_map<const HostClass*, HostClass::Slots>& threadSlots() {
     return t;
 }
 
-struct BrandedHandle {
-    static constexpr uint64_t kMagic = 0x42524F5646534843ULL; // "BROVFSHC"
-    uint64_t magic = kMagic;
+struct Brand {
     const HostClass* cls = nullptr;
-    void* data = nullptr;
     ev::HandleDestructor dtor = nullptr;
 };
+
+std::mutex& brandMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<const void*, Brand>& brands() {
+    static auto* m = new std::unordered_map<const void*, Brand>();
+    return *m;
+}
+
+void brandedDestroy(void* data) {
+    ev::HandleDestructor dtor = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(brandMutex());
+        auto& m = brands();
+        auto it = m.find(data);
+        if (it != m.end()) {
+            dtor = it->second.dtor;
+            m.erase(it);
+        }
+    }
+    if (dtor) dtor(data);
+}
 
 } // namespace
 
@@ -98,22 +120,22 @@ void HostClass::inherit(const HostClass& base) const {
 }
 
 Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) const {
-    auto* bh = new BrandedHandle{BrandedHandle::kMagic, this, data, dtor};
-    auto wrapperDtor = +[](void* raw) {
-        auto* b = static_cast<BrandedHandle*>(raw);
-        if (b->dtor) b->dtor(b->data);
-        b->magic = 0;
-        delete b;
-    };
+    if (data) {
+        std::lock_guard<std::mutex> lk(brandMutex());
+        brands()[data] = Brand{this, dtor};
+    }
     const Slots* s = slotsIfAny();
-    if (!s || !s->proto) return ev::makeHandle(bh, wrapperDtor, when);
-    return ev::makeHandle(bh, wrapperDtor, when, s->proto->get());
+    if (!s || !s->proto) return ev::makeHandle(data, data ? brandedDestroy : dtor, when);
+    return ev::makeHandle(data, data ? brandedDestroy : dtor, when, s->proto->get());
 }
 
 void* HostClass::unwrap(Value val) const {
-    auto* bh = static_cast<BrandedHandle*>(ev::handleData(val));
-    if (!bh || bh->magic != BrandedHandle::kMagic || bh->cls != this) return nullptr;
-    return bh->data;
+    void* data = ev::handleData(val);
+    if (!data) return nullptr;
+    std::lock_guard<std::mutex> lk(brandMutex());
+    auto& m = brands();
+    auto it = m.find(data);
+    return (it != m.end() && it->second.cls == this) ? data : nullptr;
 }
 
 void HostClass::setStatic(const char* name, Value v) const {
