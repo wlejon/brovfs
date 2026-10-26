@@ -108,6 +108,7 @@ void installModelOnto(Value vfsObj) {
 
         std::string pathStr = ev::toUtf8(args[0]);
         std::filesystem::path dirPath = std::filesystem::path(pathStr);
+        if (auto refused = checkPath(dirPath, PathAccess::Read)) return throwAccessError(refused);
 
 
         bro::vfs::ModelOptions opts;

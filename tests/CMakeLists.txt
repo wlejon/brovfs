@@ -50,6 +50,7 @@ endif()
 if(BROVFS_ENABLE_API)
     add_executable(brovfs_test_api
         test_vfs_api.cpp
+        test_vfs_api_gate.cpp
     )
     target_include_directories(brovfs_test_api PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

@@ -83,6 +83,8 @@ bool pumpUntil(const std::function<bool()>& condition, int timeoutMs = 5000) {
 
 } // namespace
 
+void runPathGateTests(const std::filesystem::path& tmpDir);
+
 int main() {
     namespace ev = bronze::embed;
     using namespace bronze::eval;
@@ -582,7 +584,10 @@ int main() {
         std::cout << "  DirectoryModel [PASS]" << std::endl;
     }
 
-    // 10. Clean up
+    // 10. The path gate (test_vfs_api_gate.cpp)
+    runPathGateTests(tmpDir);
+
+    // 11. Clean up
     brovfs::api::shutdownVfsAsync();
     std::filesystem::remove_all(tmpDir);
 

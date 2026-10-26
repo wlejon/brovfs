@@ -16,7 +16,7 @@ void installMiscOnto(Value vfsObj) {
         }
         std::string pathStr = ev::toUtf8(args[0]);
         std::filesystem::path p = std::filesystem::path(pathStr);
-
+        if (auto refused = checkPath(p, PathAccess::Read)) return throwAccessError(refused);
 
         auto ft = bro::vfs::MimeDatabase::system().type_for_file(p);
         if (!ft.mime.empty()) {

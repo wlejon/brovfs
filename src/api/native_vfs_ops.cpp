@@ -3,6 +3,7 @@
 #include "brovfs/undo.h"
 
 #include <filesystem>
+#include <optional>
 
 namespace brovfs::api {
 
@@ -70,6 +71,92 @@ bool isDirectoryDestination(const std::filesystem::path& p, const std::string& r
     return std::filesystem::is_directory(p, ec);
 }
 
+// The gate's answer for what reversing (undo) or replaying (redo) `rec` touches.
+// Undoing a copy removes the copy; redoing it reads the source and writes the
+// copy again. A move, either way, takes the item from one end to the other. A
+// trashed item comes back to (undo) or leaves (redo) its original path.
+PathRefusal checkJournalRecord(const bro::vfs::UndoRecord& rec, bool redo) {
+    using Action = bro::vfs::DoneItem::Action;
+    for (const auto& step : rec.steps) {
+        const auto& item = step.item;
+        PathRefusal r;
+        switch (item.action) {
+        case Action::Copied:
+            if (redo && (r = checkPath(item.source, PathAccess::Read))) return r;
+            if ((r = checkPath(item.destination, PathAccess::Write))) return r;
+            break;
+        case Action::Moved:
+            if ((r = checkPath(item.source, PathAccess::Write))) return r;
+            if ((r = checkPath(item.destination, PathAccess::Write))) return r;
+            break;
+        case Action::Trashed:
+            if ((r = checkPath(item.source, PathAccess::Write))) return r;
+            break;
+        }
+    }
+    return {};
+}
+
+const bro::vfs::UndoRecord* nextRecord(const bro::vfs::UndoJournal& j, bool redo) {
+    return redo ? j.next_redo() : j.next_undo();
+}
+
+// bro.vfs.undo() / redo(). Under a gate the record is checked here, on the JS
+// thread, and the worker acts only if it is still the next one: a record that
+// took its place meanwhile (another undo, a copy that finished) was never asked
+// about, so the step fails rather than act on it.
+Value journalStep(bool redo) {
+    ev::Persistent promise(ev::createPromise());
+
+    std::optional<uint64_t> checkedId;
+    if (pathGateActive()) {
+        auto j = activeJournal();
+        const bro::vfs::UndoRecord* rec = j ? nextRecord(*j, redo) : nullptr;
+        if (rec) {
+            if (auto refused = checkJournalRecord(*rec, redo)) {
+                return rejectWithAccessError(promise.get(), refused);
+            }
+        }
+        checkedId = rec ? rec->id : 0;
+    }
+
+    auto job = std::make_shared<VfsAsyncJob>();
+    job->promise.set(promise.get());
+
+    auto resPtr = std::make_shared<bro::vfs::OpResult>();
+    job->run = [resPtr, redo, checkedId]() {
+        auto j = activeJournal();
+        if (!j) {
+            resPtr->outcome = bro::vfs::Outcome::Failed;
+            return;
+        }
+        if (checkedId) {
+            const bro::vfs::UndoRecord* rec = nextRecord(*j, redo);
+            if ((rec ? rec->id : 0) != *checkedId) {
+                resPtr->outcome = bro::vfs::Outcome::Failed;
+                return;
+            }
+        }
+        *resPtr = redo ? j->redo() : j->undo();
+    };
+
+    job->settle = [resPtr](Value pVal) {
+        ev::resolvePromise(pVal, ev::fromBool(resPtr->ok()));
+    };
+
+    job->worker = std::thread([job]() {
+        try {
+            job->run();
+        } catch (const std::exception& e) {
+            job->error = e.what();
+        }
+        job->done.store(true, std::memory_order_release);
+    });
+
+    trackAsyncJob(job);
+    return promise.get();
+}
+
 } // namespace
 
 void installOpsOnto(Value vfsObj) {
@@ -94,6 +181,13 @@ void installOpsOnto(Value vfsObj) {
 
         std::string dstStr = ev::toUtf8(args[1]);
         std::filesystem::path dstPath = std::filesystem::path(dstStr);
+
+        if (auto refused = checkPaths(sources, PathAccess::Read)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
+        if (auto refused = checkPath(dstPath, PathAccess::Write)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
 
         bro::vfs::FileOpOptions opts = args.size() > 2 ? parseFileOpOptions(args[2]) : bro::vfs::FileOpOptions();
 
@@ -151,6 +245,13 @@ void installOpsOnto(Value vfsObj) {
         std::string dstStr = ev::toUtf8(args[1]);
         std::filesystem::path dstPath = std::filesystem::path(dstStr);
 
+        // A move removes each source as well as writing the destination.
+        if (auto refused = checkPaths(sources, PathAccess::Write)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
+        if (auto refused = checkPath(dstPath, PathAccess::Write)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
 
         bro::vfs::FileOpOptions opts = args.size() > 2 ? parseFileOpOptions(args[2]) : bro::vfs::FileOpOptions();
 
@@ -204,6 +305,9 @@ void installOpsOnto(Value vfsObj) {
             ev::rejectPromise(promise.get(), err.get());
             return promise.get();
         }
+        if (auto refused = checkPaths(paths, PathAccess::Write)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
 
         auto job = std::make_shared<VfsAsyncJob>();
         job->promise.set(promise.get());
@@ -244,70 +348,10 @@ void installOpsOnto(Value vfsObj) {
     });
 
     // bro.vfs.undo() -> Promise<boolean>
-    vfs.def("undo", 0, [](Value, std::span<const Value>) -> Value {
-        ev::Persistent promise(ev::createPromise());
-        auto job = std::make_shared<VfsAsyncJob>();
-        job->promise.set(promise.get());
-
-        auto resPtr = std::make_shared<bro::vfs::OpResult>();
-        job->run = [resPtr]() {
-            auto j = activeJournal();
-            if (j) {
-                *resPtr = j->undo();
-            } else {
-                resPtr->outcome = bro::vfs::Outcome::Failed;
-            }
-        };
-
-        job->settle = [resPtr](Value pVal) {
-            ev::resolvePromise(pVal, ev::fromBool(resPtr->ok()));
-        };
-
-        job->worker = std::thread([job]() {
-            try {
-                job->run();
-            } catch (const std::exception& e) {
-                job->error = e.what();
-            }
-            job->done.store(true, std::memory_order_release);
-        });
-
-        trackAsyncJob(job);
-        return promise.get();
-    });
+    vfs.def("undo", 0, [](Value, std::span<const Value>) -> Value { return journalStep(false); });
 
     // bro.vfs.redo() -> Promise<boolean>
-    vfs.def("redo", 0, [](Value, std::span<const Value>) -> Value {
-        ev::Persistent promise(ev::createPromise());
-        auto job = std::make_shared<VfsAsyncJob>();
-        job->promise.set(promise.get());
-
-        auto resPtr = std::make_shared<bro::vfs::OpResult>();
-        job->run = [resPtr]() {
-            auto j = activeJournal();
-            if (j) {
-                *resPtr = j->redo();
-            } else {
-                resPtr->outcome = bro::vfs::Outcome::Failed;
-            }
-        };
-
-        job->settle = [resPtr](Value pVal) {
-            ev::resolvePromise(pVal, ev::fromBool(resPtr->ok()));
-        };
-
-        job->worker = std::thread([job]() {
-            try {
-                job->run();
-            } catch (const std::exception& e) {
-                job->error = e.what();
-            }
-            job->done.store(true, std::memory_order_release);
-        });
-
-        trackAsyncJob(job);
-        return promise.get();
-    });
+    vfs.def("redo", 0, [](Value, std::span<const Value>) -> Value { return journalStep(true); });
 }
 
 } // namespace brovfs::api

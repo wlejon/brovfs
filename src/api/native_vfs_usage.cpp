@@ -181,6 +181,7 @@ void installUsageOnto(Value vfsObj) {
         if (!pathArg(args, 0, root)) {
             return ev::throwError("bro.vfs.usage requires a directory path as the first argument");
         }
+        if (auto refused = checkPath(root, PathAccess::Read)) return throwAccessError(refused);
         bro::vfs::UsageOptions opts;
         if (args.size() > 1 && ev::isObject(args[1])) {
             ev::Persistent opt(args[1]);

@@ -74,6 +74,7 @@ void installWatchOnto(Value vfsObj) {
 
         std::string pathStr = ev::toUtf8(args[0]);
         std::filesystem::path path = std::filesystem::path(pathStr);
+        if (auto refused = checkPath(path, PathAccess::Read)) return throwAccessError(refused);
 
         ev::Persistent cb(args[1]);
 

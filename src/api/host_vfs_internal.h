@@ -1,5 +1,6 @@
 #pragma once
 
+#include "api.h"
 #include "embed/embed.h"
 #include "host_class.h"
 #include "object_builder.h"
@@ -7,6 +8,7 @@
 #include "brovfs/vfs.h"
 
 #include <atomic>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -22,6 +24,25 @@ using Value = bronze::Value;
 
 Value makeError(const std::string& msg);
 Value ensureBroVfs();
+
+// The path gate's helpers (access_gate.cpp; the gate itself is in api.h).
+struct PathRefusal {
+    std::string message;  // the gate's sentence; empty when allowed
+    std::string path;     // the absolute path the gate was asked about
+    explicit operator bool() const { return !message.empty(); }
+};
+/// True when a gate is installed: natives skip work done only to ask it.
+bool pathGateActive();
+/// Asks the gate about `p` (made absolute and lexically normal).
+PathRefusal checkPath(const std::filesystem::path& p, PathAccess access);
+/// The first refusal among `paths`, or an empty one.
+PathRefusal checkPaths(const std::vector<std::filesystem::path>& paths, PathAccess access);
+/// The refusal as an Error: message, code "EACCES", path. Fresh: root it.
+Value newAccessError(const PathRefusal& refusal);
+/// Throws newAccessError into the running program.
+Value throwAccessError(const PathRefusal& refusal);
+/// Rejects `promise` with newAccessError and returns it.
+Value rejectWithAccessError(Value promise, const PathRefusal& refusal);
 
 std::shared_ptr<bro::vfs::Trash> activeTrash();
 void setTrash(std::shared_ptr<bro::vfs::Trash> trash);

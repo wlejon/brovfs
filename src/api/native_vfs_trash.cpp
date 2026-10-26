@@ -21,7 +21,9 @@ void installTrashOnto(Value vfsObj) {
 
         std::string pathStr = ev::toUtf8(args[0]);
         std::filesystem::path path = std::filesystem::path(pathStr);
-
+        if (auto refused = checkPath(path, PathAccess::Write)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
 
         auto job = std::make_shared<VfsAsyncJob>();
         job->promise.set(promise.get());
@@ -93,6 +95,27 @@ void installTrashOnto(Value vfsObj) {
 
         std::string trashId = ev::toUtf8(args[0]);
 
+        // Restoring writes the item's original path. Under a gate the trash is
+        // listed here to find it, so the gate is asked on this thread; an item
+        // the listing does not show is not restored, since nobody was asked.
+        if (pathGateActive()) {
+            bool found = false;
+            if (auto trash = activeTrash()) {
+                for (const auto& item : trash->list()) {
+                    if (item.id != trashId) continue;
+                    if (auto refused = checkPath(item.original_path, PathAccess::Write)) {
+                        return rejectWithAccessError(promise.get(), refused);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                ev::resolvePromise(promise.get(), ev::fromBool(false));
+                return promise.get();
+            }
+        }
+
         auto job = std::make_shared<VfsAsyncJob>();
         job->promise.set(promise.get());
 
@@ -139,6 +162,14 @@ void installTrashOnto(Value vfsObj) {
         };
 
         job->settle = [itemsPtr](Value pVal) {
+            // Under a gate the listing holds only items whose original path the
+            // program may read: the rest are left out, not refused, so a program
+            // granted part of the disk still sees its own trash.
+            if (pathGateActive()) {
+                std::erase_if(*itemsPtr, [](const bro::vfs::TrashItem& item) {
+                    return static_cast<bool>(checkPath(item.original_path, PathAccess::Read));
+                });
+            }
             ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(itemsPtr->size())));
             for (size_t i = 0; i < itemsPtr->size(); ++i) {
                 ev::Persistent itemVal(trashItemToJs((*itemsPtr)[i]));
@@ -164,13 +195,36 @@ void installTrashOnto(Value vfsObj) {
     vfs.def("emptyTrash", 0, [](Value, std::span<const Value>) -> Value {
         ev::Persistent promise(ev::createPromise());
 
+        // Emptying erases every item for good, each of them a write of the path
+        // it was trashed from. Under a gate every item is asked about here, one
+        // refusal erases nothing, and the worker erases exactly the items asked
+        // about (not whatever the trash holds by the time it runs).
+        std::shared_ptr<std::vector<std::string>> checkedIds;
+        if (pathGateActive()) {
+            checkedIds = std::make_shared<std::vector<std::string>>();
+            if (auto trash = activeTrash()) {
+                for (const auto& item : trash->list()) {
+                    if (auto refused = checkPath(item.original_path, PathAccess::Write)) {
+                        return rejectWithAccessError(promise.get(), refused);
+                    }
+                    checkedIds->push_back(item.id);
+                }
+            }
+        }
+
         auto job = std::make_shared<VfsAsyncJob>();
         job->promise.set(promise.get());
 
-        job->run = []() {
+        job->run = [checkedIds]() {
             auto trash = activeTrash();
-            if (trash) {
+            if (!trash) return;
+            if (!checkedIds) {
                 trash->empty();
+                return;
+            }
+            for (const auto& id : *checkedIds) {
+                std::error_code ec;
+                trash->erase(id, ec);
             }
         };
 

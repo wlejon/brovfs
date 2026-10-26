@@ -17,6 +17,9 @@ void installScanOnto(Value vfsObj) {
         }
 
         std::string pathStr = ev::toUtf8(args[0]);
+        if (auto refused = checkPath(bro::vfs::path_from_utf8(pathStr), PathAccess::Read)) {
+            return rejectWithAccessError(promise.get(), refused);
+        }
         bro::vfs::ScanOptions scanOpts;
 
         if (args.size() > 1 && ev::isObject(args[1])) {
