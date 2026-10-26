@@ -1,7 +1,6 @@
 add_library(brovfs_api STATIC
     api.cpp
     access_gate.cpp
-    host_class.cpp
     native_vfs_scan.cpp
     native_vfs_ops.cpp
     native_vfs_trash.cpp
