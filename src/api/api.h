@@ -60,6 +60,15 @@ std::shared_ptr<bro::vfs::UndoJournal> getJournal();
 // gate's sentence (named PermissionRevoked for a grant taken back), `code` is
 // "EACCES" and `path` the absolute path asked about: thrown by a synchronous
 // native, the promise rejected with it by an asynchronous one.
+//
+// A watch, a DirectoryModel and a running usage scan keep reading their folder
+// after the call returns, so each is held in the gate's ledger (holdAccess) on
+// the thread that opened it and released when it is closed. When the host
+// changes its grants and the gate refuses the folder again, the handle stops at
+// once and reports the refusal at the next tickVfsAsync: a watch's callback
+// gets one event { kind: 'error', watch, path, error } and nothing after, a
+// model's 'error' listeners are called with it (entries() is empty from then
+// on), and a usage scan is cancelled and its `done` rejects with it.
 
 } // namespace brovfs::api
 

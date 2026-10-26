@@ -1,4 +1,5 @@
 #include "host_vfs_internal.h"
+#include "brovfs/path.h"
 #include "brovfs/watcher.h"
 
 #include <filesystem>
@@ -12,15 +13,65 @@ namespace {
 struct ActiveWatch {
     bro::vfs::WatchId id{0};
     std::unique_ptr<ev::Persistent> callback;
+    std::filesystem::path path;
+    uint64_t held{0};  // the gate's ledger entry (holdPath), 0 when none
+};
+
+// A watch the host took the grant back from: already stopped, its callback
+// told at the next drain with one 'error' event carrying the refusal.
+struct RevokedWatch {
+    bro::vfs::WatchId id{0};
+    std::unique_ptr<ev::Persistent> callback;
+    std::filesystem::path path;
+    std::string refusal;
 };
 
 std::mutex g_watch_mu;
 std::shared_ptr<bro::vfs::DirectoryWatcher> g_watcher;
 std::unordered_map<bro::vfs::WatchId, ActiveWatch> g_watchers;
+std::vector<RevokedWatch> g_revoked;
+
+void revokeWatch(bro::vfs::WatchId wid, const std::string& refusal) {
+    std::lock_guard lock(g_watch_mu);
+    auto it = g_watchers.find(wid);
+    if (it == g_watchers.end()) return;
+    if (g_watcher) g_watcher->remove(wid);
+    RevokedWatch r;
+    r.id = wid;
+    r.callback = std::move(it->second.callback);
+    r.path = std::move(it->second.path);
+    r.refusal = refusal;
+    g_revoked.push_back(std::move(r));
+    g_watchers.erase(it);
+}
+
+void deliverRevokedWatches() {
+    std::vector<RevokedWatch> revoked;
+    {
+        std::lock_guard lock(g_watch_mu);
+        revoked = std::move(g_revoked);
+        g_revoked.clear();
+    }
+    for (auto& r : revoked) {
+        if (!r.callback || !ev::isFunction(r.callback->get())) continue;
+        ObjectBuilder b;
+        b.set("kind", std::string("error"));
+        b.set("watch", static_cast<double>(r.id));
+        b.set("path", bro::vfs::path_to_utf8(r.path));
+        ev::Persistent item(b.get());
+        ev::Persistent err(newRevokedError(r.refusal, r.path));
+        item.set(ev::setProperty(item.get(), "error", err.get()));
+        ev::Persistent arr(ev::makeArray(1));
+        arr.set(ev::setElement(arr.get(), 0, item.get()));
+        const Value arg = arr.get();
+        ev::call(r.callback->get(), ev::undefined(), std::span<const Value>(&arg, 1));
+    }
+}
 
 } // namespace
 
 void drainWatcherEvents() {
+    deliverRevokedWatches();
     std::vector<bro::vfs::WatchEvent> events;
     {
         std::lock_guard lock(g_watch_mu);
@@ -59,7 +110,9 @@ void drainWatcherEvents() {
 
 void clearWatchers() {
     std::lock_guard lock(g_watch_mu);
+    for (auto& [wid, w] : g_watchers) releaseHeldPath(w.held);
     g_watchers.clear();
+    g_revoked.clear();
     g_watcher.reset();
 }
 
@@ -106,7 +159,13 @@ void installWatchOnto(Value vfsObj) {
             ActiveWatch w;
             w.id = wid;
             w.callback = std::make_unique<ev::Persistent>(cb.get());
+            w.path = path;
             g_watchers[wid] = std::move(w);
+        }
+        // Held by its id: a revoke after unwatch finds nothing and does nothing.
+        if (uint64_t held = holdPath(path, [wid](const std::string& refusal) { revokeWatch(wid, refusal); })) {
+            std::lock_guard lock(g_watch_mu);
+            if (auto it = g_watchers.find(wid); it != g_watchers.end()) it->second.held = held;
         }
 
         ObjectBuilder handle;
@@ -116,7 +175,10 @@ void installWatchOnto(Value vfsObj) {
             if (g_watcher) {
                 g_watcher->remove(wid);
             }
-            g_watchers.erase(wid);
+            if (auto it = g_watchers.find(wid); it != g_watchers.end()) {
+                releaseHeldPath(it->second.held);
+                g_watchers.erase(it);
+            }
             return ev::undefined();
         });
 

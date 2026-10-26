@@ -44,6 +44,15 @@ Value newAccessError(const PathRefusal& refusal);
 Value throwAccessError(const PathRefusal& refusal);
 /// Rejects `promise` with newAccessError and returns it.
 Value rejectWithAccessError(Value promise, const PathRefusal& refusal);
+/// Holds a handle that keeps reading `p` (a watch, a directory model, a usage
+/// scan) in the gate's ledger on the calling thread: when the host takes the
+/// grant back, `revoke` runs there with the refusal and stops the handle.
+/// 0 when no gate is installed. The handle's close calls releaseHeldPath.
+uint64_t holdPath(const std::filesystem::path& p, std::function<void(const std::string& refusal)> revoke);
+void releaseHeldPath(uint64_t& id);
+/// A revoke's refusal as the Error the handle reports (PermissionRevoked for a
+/// grant taken back), code EACCES, `path` the absolute path. Fresh: root it.
+Value newRevokedError(const std::string& refusal, const std::filesystem::path& p);
 
 std::shared_ptr<bro::vfs::Trash> activeTrash();
 void setTrash(std::shared_ptr<bro::vfs::Trash> trash);

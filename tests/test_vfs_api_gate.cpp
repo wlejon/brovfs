@@ -334,3 +334,111 @@ void runPathGateTests(const fs::path& tmpDir) {
     brovfs::api::setJournal(prevJournal);
     std::cout << "  path gate [PASS]" << std::endl;
 }
+
+// What keeps reading a folder after the call returns (a watch, a directory
+// model, a usage scan) is held in the gate's ledger; when the host takes the
+// grant back it stops and says so through its own channel, an Error named
+// PermissionRevoked. What the new grants still allow stays open.
+void runRevokeTests(const fs::path& tmpDir) {
+    std::cout << "Testing revocation of held handles..." << std::endl;
+
+    const fs::path root = tmpDir / "revoke";
+    const fs::path watched = root / "watched";
+    const fs::path listed = root / "listed";
+    const fs::path counted = root / "counted";
+    const fs::path kept = root / "kept";
+    writeFile(watched / "a.txt", "a");
+    writeFile(listed / "b.txt", "b");
+    writeFile(kept / "c.txt", "c");
+    // Enough for the usage scan to be still counting when the grant goes.
+    for (int d = 0; d < 40; ++d) {
+        for (int f = 0; f < 60; ++f) {
+            writeFile(counted / ("d" + std::to_string(d)) / ("f" + std::to_string(f) + ".txt"), "x");
+        }
+    }
+
+    auto revokedUnder = std::make_shared<std::vector<std::string>>();
+    auto mu = std::make_shared<std::mutex>();
+    ev::setAccessGate([revokedUnder, mu](const ev::AccessRequest& r) -> std::string {
+        if (r.kind != ev::AccessKind::Read && r.kind != ev::AccessKind::Write) return "";
+        std::lock_guard lock(*mu);
+        for (const auto& p : *revokedUnder) {
+            if (r.subject.substr(0, p.size()) == p) {
+                return std::string(ev::kPermissionRevokedPrefix) + "no files access: " + std::string(r.subject);
+            }
+        }
+        return "";
+    });
+
+    const size_t heldBefore = ev::heldAccessCount();
+    auto r = bronze::eval::evalScript(
+        "globalThis._rv = { watch: null, watchEvents: 0, model: null, kept: null, keptWatch: null, usage: null };\n"
+        "globalThis._rvWatch = bro.vfs.watch(" + jsStr(watched) + ", evs => {\n"
+        "  for (const e of evs) { if (e.kind === 'error') _rv.watch = e; else _rv.watchEvents++; } });\n"
+        "globalThis._rvModel = new bro.vfs.DirectoryModel(" + jsStr(listed) + ");\n"
+        "_rvModel.on('error', e => { _rv.model = e; });\n"
+        "globalThis._rvKept = new bro.vfs.DirectoryModel(" + jsStr(kept) + ");\n"
+        "_rvKept.on('error', e => { _rv.kept = e; });\n"
+        "globalThis._rvKeptWatch = bro.vfs.watch(" + jsStr(kept) + ", evs => {\n"
+        "  for (const e of evs) if (e.kind === 'error') _rv.keptWatch = e; });\n"
+        "globalThis._rvUsage = bro.vfs.usage(" + jsStr(counted) + ", { threads: 1 });\n"
+        "_rvUsage.done.then(() => { _rv.usage = 'resolved'; }, e => { _rv.usage = e; });\n");
+    GCHECK(!r.thrown, "opening the handles threw");
+    GCHECK(ev::heldAccessCount() == heldBefore + 5,
+           "five handles held: " + std::to_string(ev::heldAccessCount() - heldBefore));
+
+    {
+        std::lock_guard lock(*mu);
+        revokedUnder->push_back(gatePath(watched));
+        revokedUnder->push_back(gatePath(listed));
+        revokedUnder->push_back(gatePath(counted));
+    }
+    ev::accessChanged();
+    const int revoked = ev::revalidateHeldAccess();
+    GCHECK(revoked == 3, "three handles revoked: " + std::to_string(revoked));
+    GCHECK(ev::heldAccessCount() == heldBefore + 2, "the kept model and watch are still held");
+
+    // After the revocation the watched folder changes: the stopped watch hears nothing.
+    writeFile(watched / "after.txt", "after");
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) {
+        brovfs::api::tickVfsAsync();
+        ev::drainMicrotasks();
+        if (evalString("_rv.watch && _rv.model && _rv.usage ? 'y' : 'n'") == "y") break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    for (int i = 0; i < 30; ++i) {  // time for a stray event to arrive
+        brovfs::api::tickVfsAsync();
+        ev::drainMicrotasks();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto described = [](const std::string& expr) {
+        return evalString("(function(e) { return e && typeof e === 'object' ? e.name + '|' + e.message + '|' + "
+                          "e.code + '|' + e.path : String(e); })(" + expr + ")");
+    };
+    const std::string w = gatePath(watched);
+    std::string got = described("_rv.watch && _rv.watch.error");
+    GCHECK(got == "PermissionRevoked|no files access: " + w + "|EACCES|" + w, got);
+    got = evalString("_rv.watch.kind + '|' + (_rv.watch.watch === _rvWatch.id) + '|' + _rv.watch.path");
+    GCHECK(got.rfind("error|true|", 0) == 0, got);
+    GCHECK(evalString("String(_rv.watchEvents)") == "0", "the revoked watch still reported changes");
+    const std::string l = gatePath(listed);
+    got = described("_rv.model");
+    GCHECK(got == "PermissionRevoked|no files access: " + l + "|EACCES|" + l, got);
+    GCHECK(evalString("String(_rvModel.entries().length)") == "0", "the revoked model still lists");
+    const std::string c = gatePath(counted);
+    got = described("_rv.usage");
+    GCHECK(got == "PermissionRevoked|no files access: " + c + "|EACCES|" + c, got);
+    GCHECK(evalString("String(_rvUsage.progress().cancelled)") == "true", "the revoked scan was not cancelled");
+    GCHECK(evalString("String(_rv.kept) + '|' + String(_rv.keptWatch)") == "null|null", "a kept handle was revoked");
+    GCHECK(evalString("String(_rvKept.entries().length)") == "1", "the kept model stopped listing");
+
+    // Closing releases what is held; unwatching a revoked watch is harmless.
+    r = bronze::eval::evalScript("_rvWatch.unwatch(); _rvModel.close(); _rvKept.close(); _rvKeptWatch.unwatch();");
+    GCHECK(!r.thrown, "closing threw");
+    GCHECK(ev::heldAccessCount() == heldBefore, "closing released: " + std::to_string(ev::heldAccessCount()));
+
+    ev::setAccessGate(nullptr);
+    std::cout << "  revocation [PASS]" << std::endl;
+}

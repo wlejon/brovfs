@@ -47,6 +47,21 @@ Value throwAccessError(const PathRefusal& refusal) {
     return ev::throwAccessError(refusal.message, "EACCES", refusal.path);
 }
 
+uint64_t holdPath(const std::filesystem::path& p, std::function<void(const std::string& refusal)> revoke) {
+    if (!ev::accessGateActive()) return 0;
+    return ev::holdAccess(ev::AccessKind::Read, absoluteUtf8(p), std::move(revoke));
+}
+
+void releaseHeldPath(uint64_t& id) {
+    if (id == 0) return;
+    ev::releaseAccess(id);
+    id = 0;
+}
+
+Value newRevokedError(const std::string& refusal, const std::filesystem::path& p) {
+    return ev::newAccessError(refusal, "EACCES", absoluteUtf8(p));
+}
+
 Value rejectWithAccessError(Value promise, const PathRefusal& refusal) {
     ev::Persistent p(promise);
     ev::Persistent err(ev::newAccessError(refusal.message, "EACCES", refusal.path));

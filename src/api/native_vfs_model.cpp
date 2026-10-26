@@ -16,8 +16,20 @@ namespace {
 struct WrappedModel {
     std::shared_ptr<bro::vfs::DirectoryModel> model;
     std::vector<std::unique_ptr<ev::Persistent>> change_callbacks;
+    std::vector<std::unique_ptr<ev::Persistent>> error_callbacks;
+    std::filesystem::path dir;
     bool show_hidden = false;
+    uint64_t held = 0;       // the gate's ledger entry (holdPath), 0 when none
+    std::string revoked;     // set when the host took the grant back; reported at the next drain
 };
+
+// The model stopped: nothing more is read or reported, and its ledger entry
+// is let go.
+void closeModel(WrappedModel& w) {
+    releaseHeldPath(w.held);
+    w.change_callbacks.clear();
+    w.model.reset();
+}
 
 std::mutex g_model_mu;
 std::vector<std::weak_ptr<WrappedModel>> g_active_models;
@@ -65,6 +77,22 @@ void drainModelUpdates() {
     }
 
     for (auto& wrapped : models) {
+        if (wrapped && !wrapped->revoked.empty()) {
+            // Taken back by the host: the model is already stopped; its 'error'
+            // listeners hear why, once.
+            std::string refusal = std::move(wrapped->revoked);
+            wrapped->revoked.clear();
+            auto callbacks = std::move(wrapped->error_callbacks);
+            wrapped->error_callbacks.clear();
+            ev::Persistent err(newRevokedError(refusal, wrapped->dir));
+            const Value arg = err.get();
+            for (auto& cb : callbacks) {
+                if (cb && ev::isFunction(cb->get())) {
+                    ev::call(cb->get(), ev::undefined(), std::span<const Value>(&arg, 1));
+                }
+            }
+            continue;
+        }
         if (!wrapped || !wrapped->model) continue;
         auto updates = wrapped->model->queue()->drain();
         if (updates.empty()) continue;
@@ -95,8 +123,9 @@ void clearModels() {
         g_active_models.clear();
     }
     for (auto& w : models) {
-        w->change_callbacks.clear();
-        w->model.reset();
+        closeModel(*w);
+        w->error_callbacks.clear();
+        w->revoked.clear();
     }
 }
 
@@ -150,7 +179,17 @@ void installModelOnto(Value vfsObj) {
         auto nativeModel = std::make_shared<bro::vfs::DirectoryModel>(dirPath, opts);
         auto wrapped = std::make_shared<WrappedModel>();
         wrapped->model = nativeModel;
+        wrapped->dir = dirPath;
         wrapped->show_hidden = opts.show_hidden;
+        // Held through a weak reference: a revoke after the model is gone does nothing.
+        std::weak_ptr<WrappedModel> weak = wrapped;
+        wrapped->held = holdPath(dirPath, [weak](const std::string& refusal) {
+            auto w = weak.lock();
+            if (!w || !w->model) return;
+            w->held = 0;  // the ledger let it go before calling
+            closeModel(*w);
+            w->revoked = refusal;
+        });
 
         {
             std::lock_guard lock(g_model_mu);
@@ -160,6 +199,7 @@ void installModelOnto(Value vfsObj) {
         auto wrappedPtr = new std::shared_ptr<WrappedModel>(wrapped);
         return g_directoryModelClass.make(wrappedPtr, [](void* ptr) {
             auto p = static_cast<std::shared_ptr<WrappedModel>*>(ptr);
+            if (*p) releaseHeldPath((*p)->held);
             delete p;
         });
     }, [](ObjectBuilder& proto) {
@@ -248,6 +288,8 @@ void installModelOnto(Value vfsObj) {
             std::string eventName = ev::toUtf8(args[0]);
             if (eventName == "change") {
                 (*wrappedPtr)->change_callbacks.push_back(std::make_unique<ev::Persistent>(args[1]));
+            } else if (eventName == "error") {
+                (*wrappedPtr)->error_callbacks.push_back(std::make_unique<ev::Persistent>(args[1]));
             }
             return self;
         });
@@ -256,8 +298,9 @@ void installModelOnto(Value vfsObj) {
         proto.def("close", 0, [](Value self, std::span<const Value>) -> Value {
             auto wrappedPtr = static_cast<std::shared_ptr<WrappedModel>*>(g_directoryModelClass.unwrap(self));
             if (!wrappedPtr || !*wrappedPtr) return ev::undefined();
-            (*wrappedPtr)->change_callbacks.clear();
-            (*wrappedPtr)->model.reset();
+            closeModel(**wrappedPtr);
+            (*wrappedPtr)->error_callbacks.clear();
+            (*wrappedPtr)->revoked.clear();
             return ev::undefined();
         });
     });

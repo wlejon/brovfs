@@ -15,6 +15,8 @@ struct WrappedUsage {
     std::unique_ptr<bro::vfs::UsageScan> scan;
     ev::Persistent done; // settles once the scan finishes or is cancelled
     bool settled = false;
+    uint64_t held = 0;    // the gate's ledger entry (holdPath) while the scan runs
+    std::string revoked;  // the host took the grant back: `done` rejects with it
 };
 
 std::mutex g_usage_mu;
@@ -78,8 +80,14 @@ void drainUsageScans() {
         }
     }
     for (auto& w : finished) {
+        releaseHeldPath(w->held);
         if (w->settled) continue;
         w->settled = true;
+        if (!w->revoked.empty()) {
+            ev::Persistent err(newRevokedError(w->revoked, w->scan->root()));
+            ev::rejectPromise(w->done.get(), err.get());
+            continue;
+        }
         ev::Persistent prog(progressToJs(w->scan->progress()));
         ev::resolvePromise(w->done.get(), prog.get());
     }
@@ -92,7 +100,10 @@ void clearUsageScans() {
         scans = std::move(g_active_usage);
         g_active_usage.clear();
     }
-    for (auto& w : scans) w->scan->cancel();
+    for (auto& w : scans) {
+        releaseHeldPath(w->held);
+        w->scan->cancel();
+    }
 }
 
 void installUsageOnto(Value vfsObj) {
@@ -196,6 +207,16 @@ void installUsageOnto(Value vfsObj) {
         auto w = std::make_shared<WrappedUsage>();
         w->done.set(ev::createPromise());
         w->scan = bro::vfs::start_usage_scan(root, opts);
+        // Held while it counts, through a weak reference: a scan that settled
+        // already let go of its entry.
+        std::weak_ptr<WrappedUsage> weak = w;
+        w->held = holdPath(root, [weak](const std::string& refusal) {
+            auto s = weak.lock();
+            if (!s || s->settled || s->scan->progress().finished) return;
+            s->held = 0;  // the ledger let it go before calling
+            s->revoked = refusal;
+            s->scan->cancel();
+        });
         {
             std::lock_guard lock(g_usage_mu);
             g_active_usage.push_back(w);
