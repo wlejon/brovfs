@@ -1,10 +1,12 @@
-// bro.vfs under a path gate (api.h, "Path gate"): every native that takes a path
-// asks the gate first, a refusal is an Error carrying the gate's sentence, code
-// EACCES and the path, nothing is touched, and with the gate removed everything
-// behaves as before. Run from test_vfs_api.cpp's main against its realm.
+// bro.vfs under the host's access gate (embed/embed_access.h; api.h, "Access"):
+// every native that takes a path asks the gate first, a refusal is an Error
+// carrying the gate's sentence, code EACCES and the path, nothing is touched, and
+// with the gate removed everything behaves as before. Run from test_vfs_api.cpp's
+// main against its realm.
 
 #include "../src/api/api.h"
 #include "embed/embed.h"
+#include "embed/embed_access.h"
 #include "eval/eval.h"
 #include "brovfs/path.h"
 #include "brovfs/vfs.h"
@@ -165,11 +167,11 @@ struct TestGate {
         }
         return false;
     }
-    std::string ask(const std::string& path, brovfs::api::PathAccess access) {
+    std::string ask(const std::string& path, ev::AccessKind access) {
         ++calls;
         std::lock_guard lock(mu);
         const bool refused = under(path, noRead) ||
-                             (access == brovfs::api::PathAccess::Write && under(path, noWrite));
+                             (access == ev::AccessKind::Write && under(path, noWrite));
         return refused ? "no files access: " + path : "";
     }
     void denyWrite(const fs::path& p) {
@@ -204,8 +206,9 @@ void runPathGateTests(const fs::path& tmpDir) {
     auto gate = std::make_shared<TestGate>();
     gate->noRead.push_back(gatePath(hidden));
     gate->noWrite.push_back(gatePath(readOnly));
-    brovfs::api::setPathGate([gate](const std::string& path, brovfs::api::PathAccess access) {
-        return gate->ask(path, access);
+    ev::setAccessGate([gate](const ev::AccessRequest& r) -> std::string {
+        if (r.kind != ev::AccessKind::Read && r.kind != ev::AccessKind::Write) return "";
+        return gate->ask(std::string(r.subject), r.kind);
     });
 
     std::string r;
@@ -316,7 +319,7 @@ void runPathGateTests(const fs::path& tmpDir) {
     GCHECK(trash->list(nullptr).empty(), "allowed emptyTrash left items");
 
     // With the gate removed, nothing asks and everything works as before.
-    brovfs::api::setPathGate(nullptr);
+    ev::setAccessGate(nullptr);
     const int callsBefore = gate->calls.load();
     r = syncJs("if (typeof bro.vfs.getMime(" + jsStr(hidden / "secret.txt") + ") !== 'string') throw new Error('mime')");
     GCHECK(r == "ok", r);

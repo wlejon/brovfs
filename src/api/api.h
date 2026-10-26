@@ -32,22 +32,18 @@ void setJournal(std::shared_ptr<bro::vfs::UndoJournal> journal);
 /// Gets active undo journal.
 std::shared_ptr<bro::vfs::UndoJournal> getJournal();
 
-// ---- Path gate ------------------------------------------------------------------
+// ---- Access -----------------------------------------------------------------------
 //
-// Which paths a program may touch is the host's decision, not brovfs's: the host
-// knows which app is running and what it was granted. With no gate set (the
-// default), every path is allowed and nothing below changes.
-
-enum class PathAccess { Read, Write };
-
-/// Answers "" to allow, or the sentence the refusal carries (naming what the app
-/// lacks and the path). `path` is absolute and lexically normal (UTF-8); the host
-/// canonicalizes it (symlinks) before deciding, and a directory it allows covers
-/// what is inside. The gate is called on the JS thread that made the call,
-/// synchronously, before any work is queued, so it may block to ask the user; it
-/// must be thread-safe (Workers run natives on their own threads).
-///
-/// What each native asks:
+// Which paths a program may touch is the host's decision, not brovfs's: every
+// native that takes a path asks the host's one access gate,
+// bronze::embed::checkAccess (embed/embed_access.h), with AccessKind::Read or
+// AccessKind::Write and the path, absolute and lexically normal (UTF-8); the host
+// canonicalizes it (symlinks) before deciding, and a directory it allows covers
+// what is inside. It is asked on the JS thread that made the call, synchronously,
+// before any work is queued. With no gate installed every path is allowed and
+// nothing below changes.
+//
+// What each native asks:
 ///   copy          every source Read, the destination Write
 ///   move          every source Write, the destination Write
 ///   remove        every path Write
@@ -60,14 +56,10 @@ enum class PathAccess { Read, Write };
 ///                 Write
 ///   scan, usage, watch, DirectoryModel, getMime   the path Read
 ///
-/// A refusal is an Error whose `message` is exactly the gate's sentence, `code` is
-/// "EACCES" and `path` the absolute path asked about: thrown by a synchronous
-/// native, the promise rejected with it by an asynchronous one.
-using PathGate = std::function<std::string(const std::string& path, PathAccess access)>;
-
-/// Installs `gate` process-wide (an empty function removes it). Safe to call while
-/// realms run: calls already inside the old gate finish against it.
-void setPathGate(PathGate gate);
+// A refusal is bronze::embed::newAccessError: an Error whose `message` is the
+// gate's sentence (named PermissionRevoked for a grant taken back), `code` is
+// "EACCES" and `path` the absolute path asked about: thrown by a synchronous
+// native, the promise rejected with it by an asynchronous one.
 
 } // namespace brovfs::api
 
@@ -78,4 +70,3 @@ using brovfs::api::setTrash;
 using brovfs::api::getTrash;
 using brovfs::api::setJournal;
 using brovfs::api::getJournal;
-using brovfs::api::setPathGate;

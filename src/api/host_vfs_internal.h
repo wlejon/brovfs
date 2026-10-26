@@ -25,7 +25,8 @@ using Value = bronze::Value;
 Value makeError(const std::string& msg);
 Value ensureBroVfs();
 
-// The path gate's helpers (access_gate.cpp; the gate itself is in api.h).
+// Asking the host's access gate (access_gate.cpp; embed/embed_access.h).
+enum class PathAccess { Read, Write };
 struct PathRefusal {
     std::string message;  // the gate's sentence; empty when allowed
     std::string path;     // the absolute path the gate was asked about
