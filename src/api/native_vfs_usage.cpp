@@ -107,6 +107,9 @@ void clearUsageScans() {
 }
 
 void installUsageOnto(Value vfsObj) {
+    // Rooted before the class is made: a raw Value is stale after anything
+    // that allocates.
+    ev::Persistent receiver(vfsObj);
     g_usageScanClass.init("UsageScan", [](ObjectBuilder& proto) {
         // progress() -> { files, directories, bytes, errors, version, finished, cancelled, elapsedMs }
         proto.def("progress", 0, [](Value self, std::span<const Value>) -> Value {
@@ -184,7 +187,7 @@ void installUsageOnto(Value vfsObj) {
         });
     });
 
-    ObjectBuilder vfs(vfsObj);
+    ObjectBuilder vfs(receiver.get());
 
     // usage(path, { includeHidden, threads }) -> UsageScan, already running
     vfs.def("usage", 2, [](Value, std::span<const Value> args) -> Value {

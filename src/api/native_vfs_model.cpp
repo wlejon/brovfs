@@ -130,6 +130,9 @@ void clearModels() {
 }
 
 void installModelOnto(Value vfsObj) {
+    // Rooted before the class is made: a raw Value is stale after anything
+    // that allocates.
+    ev::Persistent receiver(vfsObj);
     g_directoryModelClass.install("DirectoryModel", 1, [](Value, std::span<const Value> args) -> Value {
         if (args.empty() || !ev::isString(args[0])) {
             return ev::throwError("DirectoryModel constructor requires a directory path as the first argument");
@@ -305,7 +308,7 @@ void installModelOnto(Value vfsObj) {
         });
     });
 
-    ObjectBuilder vfs(vfsObj);
+    ObjectBuilder vfs(receiver.get());
     vfs.set("DirectoryModel", g_directoryModelClass.constructor());
 }
 
